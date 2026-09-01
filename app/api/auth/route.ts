@@ -48,8 +48,8 @@ export async function POST(request: Request) {
           return Response.json({ error: "تم إعداد المدير مسبقاً؛ حدّث الصفحة وسجّل الدخول" }, { status: 409 });
         }
         const user = { id:existing.id, name:existing.name, role:existing.role, active:existing.active };
-        const cookie = await createSession(user, request);
-        return Response.json({ authenticated: true, user }, { headers: { "set-cookie": cookie } });
+        const session = await createSession(user, request);
+        return Response.json({ authenticated: true, user, sessionToken:session.token }, { headers: { "set-cookie": session.cookie } });
       }
       if (!isPlatformAuthenticated(request)) return Response.json({ error: "الإعداد الأول متاح لمالك الموقع فقط" }, { status: 403 });
       if (!validPin(body.pin)) return Response.json({ error: "الكود يجب أن يكون من 4 إلى 8 أرقام" }, { status: 400 });
@@ -60,8 +60,8 @@ export async function POST(request: Request) {
       const user = await db().prepare("SELECT id, name, role, active FROM users WHERE id = 'basem'").first<{ id:string; name:string; role:"admin"; active:number }>();
       if (!user) throw new Error("تعذر إعداد حساب باسم");
       await audit(user, "setup", "user", user.id, "تم إعداد حساب مدير النظام لأول مرة");
-      const cookie = await createSession(user, request);
-      return Response.json({ authenticated: true, user }, { headers: { "set-cookie": cookie } });
+      const session = await createSession(user, request);
+      return Response.json({ authenticated: true, user, sessionToken:session.token }, { headers: { "set-cookie": session.cookie } });
     }
 
     if (action === "login") {
@@ -86,8 +86,8 @@ export async function POST(request: Request) {
       }
       await clearLoginAttempts(key);
       await audit(user, "login", "user", user.id, "تم تسجيل الدخول");
-      const cookie = await createSession(user, request);
-      return Response.json({ authenticated: true, user: { id:user.id, name:user.name, role:user.role, active:user.active } }, { headers: { "set-cookie": cookie } });
+      const session = await createSession(user, request);
+      return Response.json({ authenticated: true, sessionToken:session.token, user: { id:user.id, name:user.name, role:user.role, active:user.active } }, { headers: { "set-cookie": session.cookie } });
     }
 
     if (action === "logout") {
