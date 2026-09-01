@@ -13,6 +13,7 @@ export async function GET(request:Request) {
 }
 
 export async function POST(request:Request) {
+  if (process.env.WHATSAPP_ENABLED !== "1") return Response.json({ ok:true, skipped:"whatsapp_disabled" });
   const raw = await request.text();
   if (!verifyMetaSignature(raw, request.headers.get("x-hub-signature-256"))) return new Response("Invalid signature", { status:401 });
   try {
