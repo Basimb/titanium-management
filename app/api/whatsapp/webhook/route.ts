@@ -1,5 +1,5 @@
 import { audit, db, ensureSeedUsers } from "@/lib/titanium-server";
-import { BASIM_WHATSAPP, normalizeWhatsAppNumber, notifyManagementGroup, verifyMetaSignature } from "@/lib/whatsapp";
+import { BASIM_WHATSAPP, ensureWhatsAppTables, normalizeWhatsAppNumber, notifyManagementGroup, verifyMetaSignature } from "@/lib/whatsapp";
 
 type IncomingMessage = { id?:string; from?:string; type?:string; text?:{body?:string} };
 
@@ -29,6 +29,7 @@ async function processMessage(message:IncomingMessage) {
   if (!message.id || message.type !== "text" || !message.text?.body) return;
   const sender = normalizeWhatsAppNumber(message.from || "");
   const body = message.text.body.trim();
+  await ensureWhatsAppTables();
   const inserted = await db().prepare("INSERT OR IGNORE INTO whatsapp_messages (message_id, sender, body, processed_at, result) VALUES (?, ?, ?, ?, '')")
     .bind(message.id, sender, body, Date.now()).run();
   if (inserted.meta.changes === 0) return;
