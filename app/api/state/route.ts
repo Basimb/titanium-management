@@ -10,6 +10,7 @@ import {
   verifyPin,
   type TitaniumUser,
 } from "@/lib/titanium-server";
+import { notifyManagementGroup, taskNotification } from "@/lib/whatsapp";
 
 const seedProjects = [
   ["dabouq-setup", "تجهيز صيدلية دابوق"],
@@ -87,6 +88,7 @@ export async function POST(request: Request) {
     const body = await request.json() as Record<string, unknown>;
     const action = text(body.action);
     const now = Date.now();
+    let waNotification:string|null = null;
 
     if (action === "add_project") {
       const denied = requireAdmin(user); if (denied) return denied;
@@ -122,6 +124,7 @@ export async function POST(request: Request) {
       await db().prepare("INSERT INTO tasks (id, project_id, title, details, priority, status, suggested_owner, due_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)")
         .bind(id, projectId, title, text(body.details).trim(), priority, nullable(body.suggestedOwner), nullable(body.dueDate), now, now).run();
       await audit(user, "create", "task", id, `أضاف مهمة: ${title}`);
+      waNotification = taskNotification("create", title, user.name, nullable(body.suggestedOwner) ? `المسؤول: ${nullable(body.suggestedOwner)}` : "غير معيّنة");
     } else if (action === "edit_task") {
       const denied = requireAdmin(user); if (denied) return denied;
       const taskId = text(body.taskId); const title = text(body.title).trim();
@@ -140,6 +143,7 @@ export async function POST(request: Request) {
         return Response.json({ error: current?.owner ? `سبقك ${current.owner} واستلمها قبلك` : "تعذر استلام المهمة" }, { status: 409 });
       }
       await audit(user, "claim", "task", taskId, "استلم المهمة وبدأ تنفيذها");
+      waNotification = taskNotification("claim", task.title, user.name);
     } else if (action === "cancel_claim") {
       const taskId = text(body.taskId); const task = await taskById(taskId); if (!task) return missing("المهمة");
       if (user.id !== "basem" && task.owner !== user.name) return forbidden("إرجاع المهمة متاح لمستلمها أو باسم");
@@ -155,6 +159,7 @@ export async function POST(request: Request) {
       await db().prepare("UPDATE tasks SET status = 'open', owner = NULL, suggested_owner = ?, started_at = NULL, completed_at = NULL, rejection_reason = NULL, updated_at = ? WHERE id = ? AND archived_at IS NULL")
         .bind(target.name, now, taskId).run();
       await audit(user, "reassign", "task", taskId, `عيّن المهمة إلى ${target.name} بانتظار استلامه: ${task.title}`);
+      waNotification = taskNotification("reassign", task.title, user.name, `المسؤول: ${target.name}`);
     } else if (action === "comment") {
       const taskId = text(body.taskId); const comment = text(body.comment).trim();
       if (!comment) return bad("اكتب التعليق أولاً");
@@ -162,18 +167,21 @@ export async function POST(request: Request) {
       if (user.id !== "basem" && (task.owner !== user.name || task.status !== "progress")) return forbidden("يمكنك إضافة تحديث فقط على مهمة استلمتها وهي قيد التنفيذ");
       const result = await db().prepare("INSERT INTO comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)").bind(taskId, user.name, comment, now).run();
       await audit(user, "comment", "task", taskId, `أضاف تعليق #${result.meta.last_row_id ?? "جديد"}`);
+      waNotification = taskNotification("comment", task.title, user.name, comment.slice(0,300));
     } else if (action === "submit") {
       const taskId = text(body.taskId); const task = await taskById(taskId); if (!task) return missing("المهمة");
       if (user.id !== "basem" && task.owner !== user.name) return forbidden("المهمة ليست مستلمة باسمك");
       const result = await db().prepare("UPDATE tasks SET status = 'approval', rejection_reason = NULL, updated_at = ? WHERE id = ? AND status = 'progress'").bind(now, taskId).run();
       if (result.meta.changes === 0) return Response.json({ error: "حالة المهمة تغيّرت، حدّث الصفحة" }, { status: 409 });
       await audit(user, "submit", "task", taskId, "أرسل المهمة لاعتماد باسم");
+      waNotification = taskNotification("submit", task.title, user.name);
     } else if (action === "approve") {
       const denied = requireAdmin(user); if (denied) return denied;
       const taskId = text(body.taskId); const task = await taskById(taskId); if (!task) return missing("المهمة");
       const result = await db().prepare("UPDATE tasks SET status = 'completed', completed_at = ?, rejection_reason = NULL, updated_at = ? WHERE id = ? AND status = 'approval'").bind(now, now, taskId).run();
       if (result.meta.changes === 0) return Response.json({ error: "المهمة ليست بانتظار الاعتماد" }, { status: 409 });
       await audit(user, "approve", "task", taskId, `اعتمد إنجاز المهمة: ${task.title}`);
+      waNotification = taskNotification("approve", task.title, user.name);
     } else if (action === "reject") {
       const denied = requireAdmin(user); if (denied) return denied;
       const taskId = text(body.taskId); const reason = text(body.reason).trim();
@@ -182,6 +190,7 @@ export async function POST(request: Request) {
       const result = await db().prepare("UPDATE tasks SET status = 'progress', rejection_reason = ?, updated_at = ? WHERE id = ? AND status = 'approval'").bind(reason, now, taskId).run();
       if (result.meta.changes === 0) return Response.json({ error: "المهمة ليست بانتظار الاعتماد" }, { status: 409 });
       await audit(user, "reject", "task", taskId, `رفض الإنجاز وأعاده إلى ${task.owner ?? "المسؤول"}: ${reason}`);
+      waNotification = taskNotification("reject", task.title, user.name, `السبب: ${reason}`);
     } else if (action === "archive_task") {
       const denied = requireAdmin(user); if (denied) return denied;
       const taskId = text(body.taskId); const task = await taskById(taskId); if (!task) return missing("المهمة");
@@ -239,6 +248,7 @@ export async function POST(request: Request) {
       return bad("الطلب غير معروف");
     }
 
+    if (waNotification) await notifyManagementGroup(waNotification).catch(error => console.error("WhatsApp notification failed", error));
     return loadState(user);
   } catch (error) {
     const message = error instanceof Error ? error.message : "تعذر حفظ التحديث";
