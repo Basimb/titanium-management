@@ -75,7 +75,7 @@ export default function Dashboard() {
     const headers:Record<string,string> = {};
     if (json) headers["content-type"] = "application/json";
     const token = sessionTokenRef.current;
-    if (token) headers.authorization = `Bearer ${token}`;
+    if (token) headers["x-titanium-session"] = token;
     return headers;
   }
 
