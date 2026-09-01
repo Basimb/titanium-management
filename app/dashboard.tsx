@@ -72,7 +72,7 @@ export default function Dashboard() {
 
   async function refreshAuth() {
     try {
-      const response = await fetch("/api/auth", { cache:"no-store" });
+      const response = await fetch("/api/auth", { cache:"no-store", credentials:"include" });
       const auth = await response.json();
       if (!response.ok) throw new Error(auth.error || "تعذر فحص الدخول");
       setLoginUsers(auth.users || []); setSetupRequired(Boolean(auth.setupRequired)); setPlatformAuthenticated(Boolean(auth.platformAuthenticated));
@@ -87,7 +87,7 @@ export default function Dashboard() {
   }
 
   async function loadState() {
-    const response = await fetch("/api/state", { cache:"no-store" });
+    const response = await fetch("/api/state", { cache:"no-store", credentials:"include" });
     const next = await response.json();
     if (!response.ok) {
       if (response.status === 401) { setData(emptyState); return; }
@@ -98,7 +98,7 @@ export default function Dashboard() {
   }
 
   async function authAction(payload:Record<string,unknown>, success:string) {
-    const response = await fetch("/api/auth", { method:"POST", credentials:"same-origin", headers:{ "content-type":"application/json" }, body:JSON.stringify(payload) });
+    const response = await fetch("/api/auth", { method:"POST", credentials:"include", headers:{ "content-type":"application/json" }, body:JSON.stringify(payload) });
     const next = await response.json();
     if (!response.ok) { toast.error(next.error || "تعذر تسجيل الدخول"); return false; }
     toast.success(success); setLoginPin(""); setSetupPin(""); setSetupRequired(false);
