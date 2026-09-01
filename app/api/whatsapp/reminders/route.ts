@@ -1,10 +1,11 @@
 import { db } from "@/lib/titanium-server";
-import { notifyManagementGroup, whatsappConfigured } from "@/lib/whatsapp";
+import { ensureWhatsAppTables, notifyManagementGroup, whatsappConfigured } from "@/lib/whatsapp";
 
 export async function POST(request:Request) {
   const secret = request.headers.get("x-cron-secret");
   if (!process.env.TITANIUM_CRON_SECRET || secret !== process.env.TITANIUM_CRON_SECRET) return new Response("Forbidden", { status:403 });
   if (!whatsappConfigured()) return Response.json({ ok:true, skipped:"whatsapp_not_configured" });
+  await ensureWhatsAppTables();
   const today = new Date().toLocaleDateString("en-CA", { timeZone:"Asia/Amman" });
   const inserted = await db().prepare("INSERT OR IGNORE INTO reminder_runs (run_date, created_at) VALUES (?, ?)").bind(today,Date.now()).run();
   if (inserted.meta.changes === 0) return Response.json({ ok:true, skipped:"already_sent" });
