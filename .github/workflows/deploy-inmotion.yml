@@ -40,7 +40,7 @@ jobs:
       - name: Configure SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.INMOTION_SSH_KEY }}
-          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+          INMOTION_HOST: amsngx368.inmotionhosting.com
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/inmotion
@@ -49,14 +49,14 @@ jobs:
 
       - name: Upload release
         env:
-          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+          INMOTION_HOST: amsngx368.inmotionhosting.com
           INMOTION_USER: ${{ secrets.INMOTION_USER }}
         run: |
           scp -i ~/.ssh/inmotion titanium-release.tar.gz "$INMOTION_USER@$INMOTION_HOST:/home/$INMOTION_USER/titanium-release.tar.gz"
 
       - name: Activate release
         env:
-          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+          INMOTION_HOST: amsngx368.inmotionhosting.com
           INMOTION_USER: ${{ secrets.INMOTION_USER }}
         run: |
           ssh -i ~/.ssh/inmotion "$INMOTION_USER@$INMOTION_HOST" 'set -eu
@@ -79,7 +79,7 @@ jobs:
       - name: Configure SSH
         env:
           SSH_PRIVATE_KEY: ${{ secrets.INMOTION_SSH_KEY }}
-          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+          INMOTION_HOST: amsngx368.inmotionhosting.com
         run: |
           install -m 700 -d ~/.ssh
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/inmotion
@@ -87,7 +87,7 @@ jobs:
           ssh-keyscan -H "$INMOTION_HOST" >> ~/.ssh/known_hosts
       - name: Record result on InMotion
         env:
-          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+          INMOTION_HOST: amsngx368.inmotionhosting.com
           INMOTION_USER: ${{ secrets.INMOTION_USER }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: |
