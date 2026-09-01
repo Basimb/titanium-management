@@ -76,7 +76,12 @@ export default function Dashboard() {
       const auth = await response.json();
       if (!response.ok) throw new Error(auth.error || "تعذر فحص الدخول");
       setLoginUsers(auth.users || []); setSetupRequired(Boolean(auth.setupRequired)); setPlatformAuthenticated(Boolean(auth.platformAuthenticated));
-      if (auth.authenticated) await loadState();
+      if (auth.authenticated && auth.user) {
+        // Reflect the authenticated user immediately. This also avoids keeping the
+        // login dialog open while mobile WebKit applies the session cookie.
+        setData(current => ({ ...current, currentUser: auth.user }));
+        await loadState();
+      }
     } catch (error) { toast.error(error instanceof Error ? error.message : "تعذر فحص الدخول"); }
     finally { setLoading(false); }
   }
@@ -93,10 +98,13 @@ export default function Dashboard() {
   }
 
   async function authAction(payload:Record<string,unknown>, success:string) {
-    const response = await fetch("/api/auth", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify(payload) });
+    const response = await fetch("/api/auth", { method:"POST", credentials:"same-origin", headers:{ "content-type":"application/json" }, body:JSON.stringify(payload) });
     const next = await response.json();
     if (!response.ok) { toast.error(next.error || "تعذر تسجيل الدخول"); return false; }
-    toast.success(success); setLoginPin(""); setSetupPin(""); setSetupRequired(false); await refreshAuth(); return true;
+    toast.success(success); setLoginPin(""); setSetupPin(""); setSetupRequired(false);
+    if (next.user) setData(current => ({ ...current, currentUser: next.user }));
+    await loadState();
+    return true;
   }
 
   async function logout() {
