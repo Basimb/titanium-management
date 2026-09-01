@@ -70,3 +70,25 @@ jobs:
             touch "$APP/tmp/restart.txt"
             rm -rf "$STAGE"
             rm -f /home/'"$INMOTION_USER"'/titanium-release.tar.gz'
+
+  report-to-server:
+    if: always()
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.INMOTION_SSH_KEY }}
+          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/inmotion
+          chmod 600 ~/.ssh/inmotion
+          ssh-keyscan -H "$INMOTION_HOST" >> ~/.ssh/known_hosts
+      - name: Record result on InMotion
+        env:
+          INMOTION_HOST: ${{ secrets.INMOTION_HOST }}
+          INMOTION_USER: ${{ secrets.INMOTION_USER }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          ssh -i ~/.ssh/inmotion "$INMOTION_USER@$INMOTION_HOST" "printf '%s\\n' '$DEPLOY_RESULT' > /home/$INMOTION_USER/titanium-deploy-result.txt"
