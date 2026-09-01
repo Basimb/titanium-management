@@ -9,7 +9,9 @@ export type TitaniumUser = {
   active: number;
 };
 
-const SESSION_COOKIE = "titanium_session";
+// The __Host- prefix prevents proxy/domain ambiguity and requires the cookie
+// to stay host-only, Secure, and scoped to the site root.
+const SESSION_COOKIE = "__Host-titanium_session";
 const SESSION_DAYS = 30;
 const encoder = new TextEncoder();
 
@@ -136,15 +138,14 @@ export async function createSession(user: TitaniumUser, request: Request) {
   const maxAge = SESSION_DAYS * 86400;
   await db().prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
     .bind(tokenHash, user.id, now + maxAge * 1000, now).run();
-  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure}`;
+  void request;
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
 }
 
 export async function destroySession(request: Request) {
   const token = readCookie(request.headers.get("cookie"), SESSION_COOKIE);
   if (token) await db().prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256(token)).run();
-  const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`;
+  return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
 
 export async function audit(user: TitaniumUser | null, action: string, entityType: string, entityId: string, summary: string) {
