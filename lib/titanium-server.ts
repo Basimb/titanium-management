@@ -105,7 +105,9 @@ export function validPin(pin: unknown): pin is string {
 
 export async function getSessionUser(request: Request): Promise<TitaniumUser | null> {
   await ensureSeedUsers();
-  const token = readCookie(request.headers.get("cookie"), SESSION_COOKIE);
+  const authorization = request.headers.get("authorization");
+  const bearer = authorization?.startsWith("Bearer ") ? authorization.slice(7).trim() : null;
+  const token = bearer || readCookie(request.headers.get("cookie"), SESSION_COOKIE);
   if (!token) return null;
   const tokenHash = await sha256(token);
   const now = Date.now();
@@ -139,11 +141,16 @@ export async function createSession(user: TitaniumUser, request: Request) {
   await db().prepare("INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
     .bind(tokenHash, user.id, now + maxAge * 1000, now).run();
   void request;
-  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+  return {
+    token,
+    cookie: `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`,
+  };
 }
 
 export async function destroySession(request: Request) {
-  const token = readCookie(request.headers.get("cookie"), SESSION_COOKIE);
+  const authorization = request.headers.get("authorization");
+  const bearer = authorization?.startsWith("Bearer ") ? authorization.slice(7).trim() : null;
+  const token = bearer || readCookie(request.headers.get("cookie"), SESSION_COOKIE);
   if (token) await db().prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256(token)).run();
   return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
