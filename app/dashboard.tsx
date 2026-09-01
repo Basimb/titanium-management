@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Archive, Clock3, Edit3, FileText, FolderPlus, History, KeyRound, LogOut, Paperclip, Plus, RotateCcw, Search, Trash2, Upload, UserCog, XCircle } from "lucide-react";
 import { toast, Toaster } from "sonner";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
@@ -65,14 +65,23 @@ export default function Dashboard() {
   const [oldPin, setOldPin] = useState("");
   const [newPin, setNewPin] = useState("");
   const [now, setNow] = useState(() => Date.now());
+  const sessionTokenRef = useRef("");
 
   const currentUser = data.currentUser;
   const isAdmin = currentUser?.id === "basem" && currentUser.role === "admin";
   const selectedLoginUser = loginUsers.find(user => user.id === loginUserId);
 
+  function sessionHeaders(json = false):Record<string,string> {
+    const headers:Record<string,string> = {};
+    if (json) headers["content-type"] = "application/json";
+    const token = sessionTokenRef.current;
+    if (token) headers.authorization = `Bearer ${token}`;
+    return headers;
+  }
+
   async function refreshAuth() {
     try {
-      const response = await fetch("/api/auth", { cache:"no-store", credentials:"include" });
+      const response = await fetch("/api/auth", { cache:"no-store", credentials:"include", headers:sessionHeaders() });
       const auth = await response.json();
       if (!response.ok) throw new Error(auth.error || "تعذر فحص الدخول");
       setLoginUsers(auth.users || []); setSetupRequired(Boolean(auth.setupRequired)); setPlatformAuthenticated(Boolean(auth.platformAuthenticated));
@@ -87,7 +96,7 @@ export default function Dashboard() {
   }
 
   async function loadState() {
-    const response = await fetch("/api/state", { cache:"no-store", credentials:"include" });
+    const response = await fetch("/api/state", { cache:"no-store", credentials:"include", headers:sessionHeaders() });
     const next = await response.json();
     if (!response.ok) {
       if (response.status === 401) { setData(emptyState); return; }
@@ -101,6 +110,7 @@ export default function Dashboard() {
     const response = await fetch("/api/auth", { method:"POST", credentials:"include", headers:{ "content-type":"application/json" }, body:JSON.stringify(payload) });
     const next = await response.json();
     if (!response.ok) { toast.error(next.error || "تعذر تسجيل الدخول"); return false; }
+    if (next.sessionToken) sessionTokenRef.current = next.sessionToken;
     toast.success(success); setLoginPin(""); setSetupPin(""); setSetupRequired(false);
     if (next.user) setData(current => ({ ...current, currentUser: next.user }));
     await loadState();
@@ -108,12 +118,13 @@ export default function Dashboard() {
   }
 
   async function logout() {
-    await fetch("/api/auth", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify({ action:"logout" }) });
+    await fetch("/api/auth", { method:"POST", headers:sessionHeaders(true), body:JSON.stringify({ action:"logout" }) });
+    sessionTokenRef.current = "";
     setData(emptyState); toast.success("تم تسجيل الخروج"); await refreshAuth();
   }
 
   async function mutate(payload:Record<string,unknown>, success:string) {
-    const response = await fetch("/api/state", { method:"POST", headers:{ "content-type":"application/json" }, body:JSON.stringify(payload) });
+    const response = await fetch("/api/state", { method:"POST", headers:sessionHeaders(true), body:JSON.stringify(payload) });
     const next = await response.json();
     if (!response.ok) {
       if (response.status === 401) { setData(emptyState); await refreshAuth(); }
@@ -125,13 +136,13 @@ export default function Dashboard() {
   async function uploadAttachment(taskId:string, file:File|null) {
     if (!file) { toast.error("اختر الملف أولاً"); return; }
     const form = new FormData(); form.append("taskId", taskId); form.append("file", file);
-    const response = await fetch("/api/attachments", { method:"POST", body:form }); const next = await response.json();
+    const response = await fetch("/api/attachments", { method:"POST", headers:sessionHeaders(), body:form }); const next = await response.json();
     if (!response.ok) { toast.error(next.error || "تعذر رفع الملف"); return; }
     await loadState(); toast.success("تم إرفاق الملف");
   }
 
   async function removeAttachment(id:string) {
-    const response = await fetch("/api/attachments", { method:"DELETE", headers:{ "content-type":"application/json" }, body:JSON.stringify({ id }) }); const next = await response.json();
+    const response = await fetch("/api/attachments", { method:"DELETE", headers:sessionHeaders(true), body:JSON.stringify({ id }) }); const next = await response.json();
     if (!response.ok) { toast.error(next.error || "تعذر حذف الملف"); return; }
     await loadState(); toast.success("تم حذف الملف");
   }
