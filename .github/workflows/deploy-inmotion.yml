@@ -1,19 +1,21 @@
-name: Deploy to InMotion
+name: Build InMotion Release
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
-  group: titanium-production
-  cancel-in-progress: false
+  group: titanium-release
+  cancel-in-progress: true
 
 jobs:
-  deploy:
+  build-release:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,58 +39,19 @@ jobs:
           cp -a public/. release/public/
           tar -czf titanium-release.tar.gz -C release .
 
-      - name: Configure SSH
+      - name: Publish release branch
         env:
-          SSH_PRIVATE_KEY: ${{ secrets.INMOTION_SSH_KEY }}
-          INMOTION_HOST: 213.165.247.93
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/inmotion
-          chmod 600 ~/.ssh/inmotion
-          ssh-keyscan -p 2222 -H "$INMOTION_HOST" >> ~/.ssh/known_hosts
-
-      - name: Upload release
-        env:
-          INMOTION_HOST: 213.165.247.93
-          INMOTION_USER: ${{ secrets.INMOTION_USER }}
-        run: |
-          scp -P 2222 -i ~/.ssh/inmotion titanium-release.tar.gz "$INMOTION_USER@$INMOTION_HOST:/home/$INMOTION_USER/titanium-release.tar.gz"
-
-      - name: Activate release
-        env:
-          INMOTION_HOST: 213.165.247.93
-          INMOTION_USER: ${{ secrets.INMOTION_USER }}
-        run: |
-          ssh -p 2222 -i ~/.ssh/inmotion "$INMOTION_USER@$INMOTION_HOST" 'set -eu
-            APP=/home/'"$INMOTION_USER"'/management.titanium-pharmacy.com
-            STAGE=/home/'"$INMOTION_USER"'/titanium-release-stage
-            rm -rf "$STAGE"
-            mkdir -p "$STAGE"
-            tar -xzf /home/'"$INMOTION_USER"'/titanium-release.tar.gz -C "$STAGE"
-            cp -a "$STAGE"/. "$APP"/
-            mkdir -p "$APP/tmp"
-            touch "$APP/tmp/restart.txt"
-            rm -rf "$STAGE"
-            rm -f /home/'"$INMOTION_USER"'/titanium-release.tar.gz'
-
-  report-to-server:
-    if: always()
-    needs: deploy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure SSH
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.INMOTION_SSH_KEY }}
-          INMOTION_HOST: 213.165.247.93
-        run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/inmotion
-          chmod 600 ~/.ssh/inmotion
-          ssh-keyscan -p 2222 -H "$INMOTION_HOST" >> ~/.ssh/known_hosts
-      - name: Record result on InMotion
-        env:
-          INMOTION_HOST: 213.165.247.93
-          INMOTION_USER: ${{ secrets.INMOTION_USER }}
-          DEPLOY_RESULT: ${{ needs.deploy.result }}
-        run: |
-          ssh -p 2222 -i ~/.ssh/inmotion "$INMOTION_USER@$INMOTION_HOST" "printf '%s\\n' '$DEPLOY_RESULT' > /home/$INMOTION_USER/titanium-deploy-result.txt"
+          workdir="$(mktemp -d)"
+          cp titanium-release.tar.gz "$workdir/"
+          cd "$workdir"
+          git init
+          git checkout -b release
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          printf '%s\n' "$SOURCE_SHA" > source-sha.txt
+          git add titanium-release.tar.gz source-sha.txt
+          git commit -m "Release $SOURCE_SHA"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push --force origin release
