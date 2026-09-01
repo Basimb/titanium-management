@@ -105,9 +105,11 @@ export function validPin(pin: unknown): pin is string {
 
 export async function getSessionUser(request: Request): Promise<TitaniumUser | null> {
   await ensureSeedUsers();
-  const authorization = request.headers.get("authorization");
-  const bearer = authorization?.startsWith("Bearer ") ? authorization.slice(7).trim() : null;
-  const token = bearer || readCookie(request.headers.get("cookie"), SESSION_COOKIE);
+  // Shared hosting proxies commonly strip the Authorization header before it
+  // reaches Passenger. Use an application-specific header for the in-memory
+  // mobile fallback, while retaining the host-only cookie as the primary path.
+  const fallbackToken = request.headers.get("x-titanium-session")?.trim() || null;
+  const token = fallbackToken || readCookie(request.headers.get("cookie"), SESSION_COOKIE);
   if (!token) return null;
   const tokenHash = await sha256(token);
   const now = Date.now();
@@ -148,9 +150,8 @@ export async function createSession(user: TitaniumUser, request: Request) {
 }
 
 export async function destroySession(request: Request) {
-  const authorization = request.headers.get("authorization");
-  const bearer = authorization?.startsWith("Bearer ") ? authorization.slice(7).trim() : null;
-  const token = bearer || readCookie(request.headers.get("cookie"), SESSION_COOKIE);
+  const fallbackToken = request.headers.get("x-titanium-session")?.trim() || null;
+  const token = fallbackToken || readCookie(request.headers.get("cookie"), SESSION_COOKIE);
   if (token) await db().prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256(token)).run();
   return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
 }
