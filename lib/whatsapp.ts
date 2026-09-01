@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { db } from "@/lib/titanium-server";
 
 const GRAPH_VERSION = process.env.META_WA_GRAPH_VERSION || "v23.0";
 
@@ -7,6 +8,11 @@ export const BASIM_WHATSAPP = normalizeWhatsAppNumber(process.env.META_WA_ADMIN_
 
 export function whatsappConfigured() {
   return process.env.WHATSAPP_ENABLED === "1" && Boolean(process.env.META_WA_ACCESS_TOKEN && process.env.META_WA_PHONE_NUMBER_ID);
+}
+
+export async function ensureWhatsAppTables() {
+  await db().prepare("CREATE TABLE IF NOT EXISTS whatsapp_messages (message_id TEXT PRIMARY KEY NOT NULL, sender TEXT NOT NULL, body TEXT NOT NULL, processed_at INTEGER NOT NULL, result TEXT DEFAULT '' NOT NULL)").run();
+  await db().prepare("CREATE TABLE IF NOT EXISTS reminder_runs (run_date TEXT PRIMARY KEY NOT NULL, created_at INTEGER NOT NULL)").run();
 }
 
 export function normalizeWhatsAppNumber(value: string) {
