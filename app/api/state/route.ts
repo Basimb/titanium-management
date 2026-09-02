@@ -12,6 +12,24 @@ import {
 } from "@/lib/titanium-server";
 import { notifyManagementGroup, taskNotification } from "@/lib/whatsapp";
 
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+const PRIVATE_RESPONSE_HEADERS = {
+  "cache-control": "private, no-store, no-cache, max-age=0, must-revalidate",
+  "cdn-cache-control": "no-store",
+  pragma: "no-cache",
+  expires: "0",
+  vary: "Cookie, X-Titanium-Session",
+} as const;
+
+function privateJson(body: unknown, init: ResponseInit = {}) {
+  const headers = new Headers(init.headers);
+  for (const [name, value] of Object.entries(PRIVATE_RESPONSE_HEADERS)) headers.set(name, value);
+  return Response.json(body, { ...init, headers });
+}
+
+
 const seedProjects = [
   ["dabouq-setup", "تجهيز صيدلية دابوق"],
   ["dabouq-license", "ترخيص ونقل ملكية دابوق"],
@@ -65,7 +83,7 @@ async function loadState(user: TitaniumUser) {
     db().prepare("SELECT id, task_id AS taskId, file_name AS fileName, content_type AS contentType, size, uploaded_by AS uploadedBy, created_at AS createdAt FROM attachments ORDER BY created_at DESC").all(),
     db().prepare("SELECT id, actor_user_id AS actorUserId, actor_name AS actorName, action, entity_type AS entityType, entity_id AS entityId, details, created_at AS createdAt FROM audit_logs ORDER BY created_at DESC, id DESC").all(),
   ]);
-  return Response.json({ currentUser:user, projects:projects.results, tasks:tasks.results, comments:comments.results, users:users.results, attachments:attachments.results, activity:activity.results });
+  return privateJson({ currentUser:user, projects:projects.results, tasks:tasks.results, comments:comments.results, users:users.results, attachments:attachments.results, activity:activity.results });
 }
 
 export async function GET(request: Request) {
@@ -75,7 +93,7 @@ export async function GET(request: Request) {
     if (auth.response) return auth.response;
     return loadState(auth.user!);
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "تعذر تحميل البيانات" }, { status: 500 });
+    return privateJson({ error: error instanceof Error ? error.message : "تعذر تحميل البيانات" }, { status: 500 });
   }
 }
 
@@ -140,7 +158,7 @@ export async function POST(request: Request) {
         .bind(user.name, now, now, taskId, user.name, user.id).run();
       if (result.meta.changes === 0) {
         const current = await taskById(taskId);
-        return Response.json({ error: current?.owner ? `سبقك ${current.owner} واستلمها قبلك` : "تعذر استلام المهمة" }, { status: 409 });
+        return privateJson({ error: current?.owner ? `سبقك ${current.owner} واستلمها قبلك` : "تعذر استلام المهمة" }, { status: 409 });
       }
       await audit(user, "claim", "task", taskId, "استلم المهمة وبدأ تنفيذها");
       waNotification = taskNotification("claim", task.title, user.name);
@@ -172,14 +190,14 @@ export async function POST(request: Request) {
       const taskId = text(body.taskId); const task = await taskById(taskId); if (!task) return missing("المهمة");
       if (user.id !== "basem" && task.owner !== user.name) return forbidden("المهمة ليست مستلمة باسمك");
       const result = await db().prepare("UPDATE tasks SET status = 'approval', rejection_reason = NULL, updated_at = ? WHERE id = ? AND status = 'progress'").bind(now, taskId).run();
-      if (result.meta.changes === 0) return Response.json({ error: "حالة المهمة تغيّرت، حدّث الصفحة" }, { status: 409 });
+      if (result.meta.changes === 0) return privateJson({ error: "حالة المهمة تغيّرت، حدّث الصفحة" }, { status: 409 });
       await audit(user, "submit", "task", taskId, "أرسل المهمة لاعتماد باسم");
       waNotification = taskNotification("submit", task.title, user.name);
     } else if (action === "approve") {
       const denied = requireAdmin(user); if (denied) return denied;
       const taskId = text(body.taskId); const task = await taskById(taskId); if (!task) return missing("المهمة");
       const result = await db().prepare("UPDATE tasks SET status = 'completed', completed_at = ?, rejection_reason = NULL, updated_at = ? WHERE id = ? AND status = 'approval'").bind(now, now, taskId).run();
-      if (result.meta.changes === 0) return Response.json({ error: "المهمة ليست بانتظار الاعتماد" }, { status: 409 });
+      if (result.meta.changes === 0) return privateJson({ error: "المهمة ليست بانتظار الاعتماد" }, { status: 409 });
       await audit(user, "approve", "task", taskId, `اعتمد إنجاز المهمة: ${task.title}`);
       waNotification = taskNotification("approve", task.title, user.name);
     } else if (action === "reject") {
@@ -188,7 +206,7 @@ export async function POST(request: Request) {
       if (!reason) return bad("سبب الرفض مطلوب");
       const task = await taskById(taskId); if (!task) return missing("المهمة");
       const result = await db().prepare("UPDATE tasks SET status = 'progress', rejection_reason = ?, updated_at = ? WHERE id = ? AND status = 'approval'").bind(reason, now, taskId).run();
-      if (result.meta.changes === 0) return Response.json({ error: "المهمة ليست بانتظار الاعتماد" }, { status: 409 });
+      if (result.meta.changes === 0) return privateJson({ error: "المهمة ليست بانتظار الاعتماد" }, { status: 409 });
       await audit(user, "reject", "task", taskId, `رفض الإنجاز وأعاده إلى ${task.owner ?? "المسؤول"}: ${reason}`);
       waNotification = taskNotification("reject", task.title, user.name, `السبب: ${reason}`);
     } else if (action === "archive_task") {
@@ -253,16 +271,16 @@ export async function POST(request: Request) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "تعذر حفظ التحديث";
     const status = message.includes("UNIQUE") ? 409 : 500;
-    return Response.json({ error: status === 409 ? "الاسم مستخدم مسبقاً" : message }, { status });
+    return privateJson({ error: status === 409 ? "الاسم مستخدم مسبقاً" : message }, { status });
   }
 }
 
 function text(value: unknown) { return typeof value === "string" ? value : ""; }
 function nullable(value: unknown) { const result = text(value).trim(); return result || null; }
 function validPriority(value: unknown) { return value === "red" || value === "green" ? value : "yellow"; }
-function bad(message: string) { return Response.json({ error: message }, { status: 400 }); }
-function forbidden(message: string) { return Response.json({ error: message }, { status: 403 }); }
-function missing(entity: string) { return Response.json({ error: `${entity} غير موجود` }, { status: 404 }); }
+function bad(message: string) { return privateJson({ error: message }, { status: 400 }); }
+function forbidden(message: string) { return privateJson({ error: message }, { status: 403 }); }
+function missing(entity: string) { return privateJson({ error: `${entity} غير موجود` }, { status: 404 }); }
 async function taskById(id: string) { return db().prepare("SELECT id, title, owner, suggested_owner AS suggestedOwner, status, started_at AS startedAt, archived_at AS archivedAt FROM tasks WHERE id = ?").bind(id).first<{id:string;title:string;owner:string|null;suggestedOwner:string|null;status:string;startedAt:number|null;archivedAt:number|null}>(); }
 async function hasProgressAfterClaim(taskId: string, startedAt: number | null) {
   if (!startedAt) return false;
