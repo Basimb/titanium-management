@@ -1,5 +1,5 @@
 import { audit, db, ensureSeedUsers } from "@/lib/titanium-server";
-import { BASIM_WHATSAPP, ensureWhatsAppTables, normalizeWhatsAppNumber, notifyManagementGroup, verifyMetaSignature } from "@/lib/whatsapp";
+import { BASIM_WHATSAPP, ensureWhatsAppTables, normalizeWhatsAppNumber, notifyManagementGroup, sendWhatsAppText, verifyMetaSignature } from "@/lib/whatsapp";
 
 type IncomingMessage = { id?:string; from?:string; type?:string; text?:{body?:string} };
 
@@ -34,6 +34,14 @@ async function processMessage(message:IncomingMessage) {
   const inserted = await db().prepare("INSERT OR IGNORE INTO whatsapp_messages (message_id, sender, body, processed_at, result) VALUES (?, ?, ?, ?, '')")
     .bind(message.id, sender, body, Date.now()).run();
   if (inserted.meta.changes === 0) return;
+  if (isDeletionRequest(body)) {
+    const acknowledgement = "✅ تم استلام طلب حذف بياناتك. سيراجعه مدير النظام ويؤكد النتيجة عبر نفس الرقم.";
+    await db().prepare("UPDATE whatsapp_messages SET result = 'deletion_request_received' WHERE message_id = ?").bind(message.id).run();
+    const notifications:Promise<unknown>[] = [sendWhatsAppText(sender, acknowledgement)];
+    if (BASIM_WHATSAPP) notifications.push(sendWhatsAppText(BASIM_WHATSAPP, `🗑️ طلب حذف بيانات WhatsApp من الرقم: ${sender}`));
+    await Promise.allSettled(notifications);
+    return;
+  }
   if (sender !== BASIM_WHATSAPP) {
     await db().prepare("UPDATE whatsapp_messages SET result = 'ignored_non_admin' WHERE message_id = ?").bind(message.id).run();
     return;
@@ -113,6 +121,11 @@ async function assignTask(title:string, ownerName:string) {
   await db().prepare("UPDATE tasks SET status='open', owner=NULL, suggested_owner=?, started_at=NULL, completed_at=NULL, rejection_reason=NULL, updated_at=? WHERE id=?").bind(owner.name,Date.now(),task.id).run();
   await audit({id:"basem",name:"باسم",role:"admin",active:1},"reassign","task",task.id,`عيّن من واتساب إلى ${owner.name}`);
   return `✅ تم تعيين ${task.title} إلى ${owner.name}`;
+}
+
+function isDeletionRequest(value:string) {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, " ");
+  return normalized === "حذف بياناتي" || normalized === "delete my data" || normalized === "حذف بياناتي | delete my data";
 }
 
 function help() {
