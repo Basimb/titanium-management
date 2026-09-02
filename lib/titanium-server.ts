@@ -83,7 +83,9 @@ export async function isSetupRequired() {
 
 export function isPlatformAuthenticated(request: Request) {
   void request;
-  return true;
+  // Initial setup is closed by default in production. Temporarily set this
+  // server-side flag to 1 only while initializing a fresh database.
+  return process.env.TITANIUM_ALLOW_INITIAL_SETUP === "1";
 }
 
 export async function hashPin(pin: string, salt = randomBase64(16)) {
