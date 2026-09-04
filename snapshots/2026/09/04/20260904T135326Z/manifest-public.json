@@ -1,0 +1,32 @@
+{
+  "created_at_utc": "2026-09-04T13:53:26Z",
+  "source": "management.titanium-pharmacy.com",
+  "backup_scope": [
+    "data/titanium.sqlite",
+    "data/uploads/",
+    "manifest-private.json"
+  ],
+  "format": "TITANIUM-BACKUP-V1",
+  "payload": "tar.gz",
+  "encryption": {
+    "content": "AES-256-GCM",
+    "key_wrap": "RSA-4096-OAEP-SHA256",
+    "transport_encoding": "base64"
+  },
+  "file": "titanium-data.tbk1.b64",
+  "plaintext_archive_bytes": 6793,
+  "encrypted_binary_bytes": 7393,
+  "plaintext_archive_sha256": "C8519E79F620AD59284A104C48035115E1B7468D7B9D42692D67F252BAA6C574",
+  "encrypted_binary_sha256": "272845D07E4BF19C2402117E13F5FB678D984F8F69BA15751D944E8CEB1E6BDD",
+  "base64_text_sha256": "653E5ED1D146B4ABB9C9C4EABAB20144F0A1985DF0A9506963E9282469B79525",
+  "rsa_public_key_sha256": "B89CE8B7F13E79061A16B249554DAFB65AA504DC8E6AA5BBA73D4ECA8BB73EA6",
+  "verification": {
+    "sqlite_integrity_check": "ok",
+    "local_decryption_round_trip": "ok"
+  },
+  "excluded": [
+    ".env and application secrets",
+    "temporary SQLite WAL and SHM files"
+  ]
+}
+
