@@ -41,7 +41,7 @@ jobs:
       - name: Create and download a consistent production snapshot
         env:
           INMOTION_HOST: 213.165.247.93
-          INMOTION_USER: ${{ secrets.INMOTION_USER }}
+          INMOTION_USER: titani24
           BACKUP_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
