@@ -1,0 +1,180 @@
+name: Encrypted Production Backup
+
+on:
+  push:
+    branches: [production-backups]
+    paths:
+      - ".github/workflows/backup-production.yml"
+      - "backup-recipient.pub"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: titanium-production-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout backup branch
+        uses: actions/checkout@v4
+        with:
+          ref: production-backups
+
+      - name: Configure production SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.INMOTION_SSH_KEY }}
+          INMOTION_HOST: 213.165.247.93
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/inmotion
+          chmod 600 ~/.ssh/inmotion
+          ssh-keyscan -p 2222 -H "$INMOTION_HOST" >> ~/.ssh/known_hosts
+
+      - name: Create and download a consistent production snapshot
+        env:
+          INMOTION_HOST: 213.165.247.93
+          INMOTION_USER: ${{ secrets.INMOTION_USER }}
+          BACKUP_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test -n "$INMOTION_USER"
+          REMOTE_BUNDLE="/home/$INMOTION_USER/.titanium-backup-export-$BACKUP_RUN_ID.tar.gz"
+          cleanup_remote() {
+            ssh -p 2222 -i ~/.ssh/inmotion "$INMOTION_USER@$INMOTION_HOST" \
+              "rm -f -- '$REMOTE_BUNDLE'" >/dev/null 2>&1 || true
+          }
+          trap cleanup_remote EXIT
+
+          ssh -p 2222 -i ~/.ssh/inmotion "$INMOTION_USER@$INMOTION_HOST" \
+            "bash -s -- '$BACKUP_RUN_ID'" <<'REMOTE'
+          set -euo pipefail
+          RUN_ID="$1"
+          APP="/home/$USER/management.titanium-pharmacy.com"
+          test -d "$APP"
+
+          DB="$(find "$APP" -maxdepth 5 -type f -name titanium.sqlite -print -quit 2>/dev/null || true)"
+          if [ -z "$DB" ]; then
+            for env_file in "$APP/.env" "$APP/.env.production" "$APP/.env.local"; do
+              [ -f "$env_file" ] || continue
+              value="$(sed -n 's/^[[:space:]]*TITANIUM_DATA_DIR[[:space:]]*=[[:space:]]*//p' "$env_file" | tail -n 1)"
+              value="${value%$'\r'}"
+              value="${value#\"}"; value="${value%\"}"
+              value="${value#\'}"; value="${value%\'}"
+              [ -n "$value" ] || continue
+              case "$value" in
+                /*) candidate="$value/titanium.sqlite" ;;
+                *) candidate="$APP/$value/titanium.sqlite" ;;
+              esac
+              if [ -f "$candidate" ]; then DB="$candidate"; break; fi
+            done
+          fi
+          test -n "$DB"
+          test -f "$DB"
+          DATA="$(dirname "$DB")"
+
+          TMP="$(mktemp -d "/home/$USER/.titanium-backup.XXXXXX")"
+          case "$TMP" in
+            "/home/$USER/.titanium-backup."*) ;;
+            *) exit 1 ;;
+          esac
+          cleanup_tmp() { rm -rf -- "$TMP"; }
+          trap cleanup_tmp EXIT HUP INT TERM
+          SNAP="$TMP/snapshot"
+          mkdir -p "$SNAP/data"
+
+          if command -v python3 >/dev/null 2>&1; then
+            python3 - "$DB" "$SNAP/data/titanium.sqlite" <<'PY'
+          import sqlite3
+          import sys
+
+          source_path, destination_path = sys.argv[1:3]
+          source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True, timeout=30)
+          destination = sqlite3.connect(destination_path)
+          source.backup(destination)
+          integrity = destination.execute("PRAGMA integrity_check").fetchone()
+          if not integrity or integrity[0] != "ok":
+              raise SystemExit("SQLite integrity check failed")
+          destination.close()
+          source.close()
+          PY
+          elif command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 "$DB" ".timeout 30000" ".backup '$SNAP/data/titanium.sqlite'"
+            test "$(sqlite3 "$SNAP/data/titanium.sqlite" 'PRAGMA integrity_check;')" = "ok"
+          else
+            echo "Neither python3 nor sqlite3 is available for a consistent backup" >&2
+            exit 1
+          fi
+
+          while IFS= read -r -d '' item; do
+            cp -a -- "$item" "$SNAP/data/"
+          done < <(find "$DATA" -mindepth 1 -maxdepth 1 \
+            ! -name 'titanium.sqlite' \
+            ! -name 'titanium.sqlite-wal' \
+            ! -name 'titanium.sqlite-shm' -print0)
+
+          CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          DB_BYTES="$(wc -c < "$SNAP/data/titanium.sqlite" | tr -d ' ')"
+          DATA_FILES="$(find "$SNAP/data" -type f | wc -l | tr -d ' ')"
+          DB_SHA256="$(sha256sum "$SNAP/data/titanium.sqlite" | awk '{print $1}')"
+          cat > "$SNAP/manifest-private.json" <<EOF
+          {"created_at_utc":"$CREATED","source":"management.titanium-pharmacy.com","database":"data/titanium.sqlite","database_bytes":$DB_BYTES,"database_sha256":"$DB_SHA256","data_file_count":$DATA_FILES}
+          EOF
+
+          BUNDLE="/home/$USER/.titanium-backup-export-$RUN_ID.tar.gz"
+          tar -czf "$BUNDLE" -C "$SNAP" .
+          REMOTE
+
+          scp -P 2222 -i ~/.ssh/inmotion \
+            "$INMOTION_USER@$INMOTION_HOST:$REMOTE_BUNDLE" ./titanium-production.tar.gz
+          cleanup_remote
+          trap - EXIT
+
+      - name: Encrypt snapshot before GitHub storage
+        run: |
+          set -euo pipefail
+          test -s backup-recipient.pub
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age
+          age -R backup-recipient.pub \
+            -o titanium-production.tar.gz.age titanium-production.tar.gz
+          rm -f -- titanium-production.tar.gz
+
+      - name: Store encrypted snapshot on backup branch
+        env:
+          BACKUP_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+          DEST="snapshots/${STAMP}"
+          mkdir -p "$DEST"
+          CIPHER="titanium-production.tar.gz.age"
+          CIPHER_BYTES="$(wc -c < "$CIPHER" | tr -d ' ')"
+          CIPHER_SHA256="$(sha256sum "$CIPHER" | awk '{print $1}')"
+
+          if [ "$CIPHER_BYTES" -le 47185920 ]; then
+            mv "$CIPHER" "$DEST/titanium-data.tar.gz.age"
+            PARTS=1
+          else
+            split -b 45m -d -a 3 "$CIPHER" "$DEST/titanium-data.tar.gz.age.part-"
+            rm -f -- "$CIPHER"
+            PARTS="$(find "$DEST" -type f -name '*.part-*' | wc -l | tr -d ' ')"
+          fi
+
+          cat > "$DEST/manifest-public.json" <<EOF
+          {"created_at_utc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","source":"management.titanium-pharmacy.com","encryption":"age/ssh-ed25519","encrypted_bytes":$CIPHER_BYTES,"encrypted_sha256":"$CIPHER_SHA256","parts":$PARTS,"github_run_id":"$BACKUP_RUN_ID"}
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$DEST"
+          git commit -m "Add encrypted production backup $STAMP"
+          git push origin HEAD:production-backups
+
