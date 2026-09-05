@@ -69,7 +69,8 @@ test('forged model task ID and member admin action cannot write',async t=>{
 test('manager create task and project use real authorized IDs; delete needs confirmation',async t=>{
  const f=fixture(t);const e={senderNumber:'12025550103',text:'افتح مشروع تجريبي جديد'};
  assert.equal((await f.run(command('add_project',{name:'مشروع جديد'},null),e)).status,'applied');
- assert.equal((await f.run(command('add_task',{title:'مهمة جديدة',ownerId:'member'},null,'p'),{...e,text:'ضيف مهمة جديدة لخالد'})).status,'applied');
+ assert.equal((await f.run(command('add_task',{title:'مهمة جديدة',ownerId:'member',priority:'yellow',dueDate:'unscheduled'},null,'p'),{...e,text:'ضيف مهمة جديدة لخالد بأولوية عادية وبدون موعد'})).status,'confirmation');
+ assert.equal((await f.run(undefined,{...e,text:`موافق ${pending(f.db).token}`})).status,'applied');
  assert.equal((await f.run(command('delete_task',{},'private'),{...e,text:'احذف مهمة شادي'})).status,'confirmation');assert.ok(f.db.prepare("SELECT id FROM tasks WHERE id='private'").get());
 });
 test('reused message ID changed body fails closed and cannot expose remapped replies',async t=>{
@@ -173,18 +174,19 @@ test('duplicate project names require the selected literal ID in the current mes
    assert.equal(validateSecretaryIntent(plan,input).kind,'clarify');
    assert.equal(validateSecretaryIntent(plan,{...input,text:'نفذ في project-two'}).kind,'clarify');
    assert.equal(validateSecretaryIntent(plan,{...input,text:'نفذ في project-one-extra'}).kind,'clarify');
-   assert.equal(validateSecretaryIntent(plan,{...input,text:'نفذ في project-one'}).kind,'command');
+   assert.equal(validateSecretaryIntent(plan,{...input,text:plan.action==='add_task'?'أضف مهمة إلى project-one':'نفذ في project-one'}).kind,plan.action==='add_task'?'task_draft':'command');
  }
 });
 
 test('ambiguous project creation produces clarification and never inserts into a guessed project',async t=>{
  const f=fixture(t);f.db.exec("UPDATE projects SET name='مشروع تجريبي' WHERE id='p2'");
- const manager={senderNumber:'12025550103'};const plan=command('add_task',{title:'تقرير جديد'},null,'p2');
+ const manager={senderNumber:'12025550103'};const plan=command('add_task',{title:'تقرير جديد',ownerId:'unassigned',priority:'yellow',dueDate:'unscheduled'},null,'p2');
  const before=f.db.prepare('SELECT count(*) n FROM tasks').get().n;
  assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى مشروع تجريبي'})).status,'clarify');
  assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,before);
  assert.equal(pending(f.db),undefined);
- assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى p2'})).status,'applied');
+ assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى p2 بدون مسؤول وموعد بأولوية عادية'})).status,'confirmation');
+ assert.equal((await f.run(undefined,{...manager,text:`موافق ${pending(f.db).token}`})).status,'applied');
  assert.equal(f.db.prepare("SELECT project_id FROM tasks WHERE title='تقرير جديد'").get().project_id,'p2');
 });
 

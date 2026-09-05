@@ -14,10 +14,13 @@ type Event = TeamChatEnvelope & { replyToMessageId?: string | null; responseMess
 type Result = { status: string; reply: string; taskId?: string; batchId?: string };
 type Pending = { token: string; command_json: string; snapshot_hash: string; original_text: string; source_message_id: string; expires_at: number };
 type HistoryRow = { original_text: string; result_json: string; scope_json: string };
+type TaskDraft = { projectId: string | null; title: string | null; details: string | null; priority: "red" | "yellow" | "green" | null; ownerId: string | null; dueDate: string | null };
+type IntakeRow = { draft_json: string; last_event_key: string; expires_at: number };
 const ORIGIN = "https://www.management.titanium-pharmacy.com";
 const CONFIRM_MS = 10 * 60_000;
 const HISTORY_MS = 24 * 60 * 60_000;
 const HISTORY_CHARS = 6000;
+const INTAKE_MS = 30 * 60_000;
 const SENSITIVE = new Set(["edit_project", "approve_project", "reject_project", "restore_project", "archive_project", "delete_project", "edit_task", "cancel_claim", "submit", "approve", "reject", "reopen", "reassign", "move_task", "archive_task", "restore_task", "delete_task"]);
 const LABELS: Record<string, string> = { open: "بانتظار الاستلام", progress: "قيد التنفيذ", approval: "بانتظار اعتماد باسم", completed: "معتمدة", active: "نشط", pending: "بانتظار الموافقة", rejected: "مرفوض" };
 const ACTION_LABELS: Record<string, string> = { add_project: "إنشاء مشروع", edit_project: "تعديل المشروع", approve_project: "اعتماد المشروع", reject_project: "رفض المشروع", restore_project: "إعادة فتح المشروع", archive_project: "أرشفة المشروع", delete_project: "حذف المشروع نهائيًا", add_task: "إنشاء مهمة", edit_task: "تعديل المهمة", claim: "استلام المهمة", cancel_claim: "إرجاع المهمة", comment: "إضافة تعليق", submit: "إرسال المهمة لاعتماد باسم", approve: "اعتماد إنجاز المهمة", reject: "رفض الإنجاز", reopen: "إعادة فتح المهمة", reassign: "تغيير المسؤول", move_task: "نقل المهمة", archive_task: "أرشفة المهمة", restore_task: "استعادة المهمة", delete_task: "حذف المهمة نهائيًا" };
@@ -33,6 +36,7 @@ export function migrateSecretary(db: DatabaseSync) {
   db.exec(`CREATE TABLE IF NOT EXISTS secretary_events (event_key TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,actor_id TEXT NOT NULL,conversation_key TEXT NOT NULL,original_text TEXT NOT NULL,result_json TEXT NOT NULL,scope_json TEXT NOT NULL,created_at INTEGER NOT NULL,response_message_id TEXT);
     CREATE INDEX IF NOT EXISTS secretary_history ON secretary_events(conversation_key,created_at);
     CREATE TABLE IF NOT EXISTS secretary_pending (conversation_key TEXT PRIMARY KEY,token TEXT NOT NULL,command_json TEXT NOT NULL,snapshot_hash TEXT NOT NULL,original_text TEXT NOT NULL,source_message_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS secretary_task_intake (conversation_key TEXT PRIMARY KEY,draft_json TEXT NOT NULL,last_event_key TEXT NOT NULL,expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS secretary_reminders (id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,sender_number TEXT NOT NULL,group_id TEXT,task_id TEXT NOT NULL,due_at INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending',created_at INTEGER NOT NULL,sent_at INTEGER,sending_at INTEGER,responded_at INTEGER,reply_message_id TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS secretary_reminders_due ON secretary_reminders(state,due_at);`);
 }
@@ -139,6 +143,73 @@ function isAffirmation(text: string, token: string, matchingQuote: boolean) {
 }
 function isCancellation(text: string) { return /^(?:لا|الغ[يِ]?|إلغاء|الغاء|ألغي|تراجع|cancel|no)[.!،\s]*$/iu.test(text.trim()); }
 
+function intakeRow(db: DatabaseSync, key: string): IntakeRow | undefined {
+  return db.prepare("SELECT draft_json,last_event_key,expires_at FROM secretary_task_intake WHERE conversation_key=?").get(key) as IntakeRow | undefined;
+}
+function pendingTaskDraft(pending: Pending | undefined, snapshotHash: string, now: number): TaskDraft | null {
+  if (!pending || pending.expires_at <= now || pending.snapshot_hash !== snapshotHash) return null;
+  const command = JSON.parse(pending.command_json);
+  if (command.action !== "add_task") return null;
+  return { projectId: typeof command.projectId === "string" ? command.projectId : null,
+    title: typeof command.title === "string" ? command.title : null, details: typeof command.details === "string" ? command.details : null,
+    priority: ["red", "yellow", "green"].includes(command.priority) ? command.priority : null,
+    ownerId: command.ownerId === null ? "unassigned" : typeof command.ownerId === "string" ? command.ownerId : null,
+    dueDate: command.dueDate === null ? "unscheduled" : typeof command.dueDate === "string" ? command.dueDate : null };
+}
+function availableDraft(draft: TaskDraft, state: Snapshot): TaskDraft {
+  const date = draft.dueDate;
+  const validDate = date === "unscheduled" || (typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)
+    && Number.isFinite(Date.parse(`${date}T00:00:00Z`)) && new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) === date);
+  return { projectId: state.projects.some(project => project.id === draft.projectId && project.status === "active" && !project.archivedAt) ? draft.projectId : null,
+    title: draft.title?.trim() || null, details: draft.details?.trim() || null,
+    priority: draft.priority && ["red", "yellow", "green"].includes(draft.priority) ? draft.priority : null,
+    ownerId: draft.ownerId === "unassigned" || state.users.some(user => user.id === draft.ownerId && user.active === 1) ? draft.ownerId : null,
+    dueDate: validDate ? date : null };
+}
+function intakeQuestion(draft: TaskDraft, state: Snapshot): string | null {
+  if (!draft.projectId) return `بأي مشروع بدك أضيف المهمة؟${state.projects.some(project => project.status === "active") ? ` المشاريع النشطة: ${state.projects.filter(project => project.status === "active").slice(0, 8).map(project => clean(project.name, 90)).join("، ")}.` : " ما في مشروع نشط حاليًا؛ لازم نجهّز مشروعًا أولًا."}`;
+  if (!draft.title) return "شو المهمة أو الشغل المطلوب بالضبط؟";
+  if (!draft.ownerId) return "مين بدك يمسك المهمة؟ اذكر الموظف، أو قل «بدون مسؤول حاليًا».";
+  if (!draft.priority) return "شو أولويتها: 🔴 عالية، 🟡 عادية، ولا 🟢 منخفضة؟ هاي أولوية الشغل، مش حالة تنفيذه.";
+  if (!draft.dueDate) return "شو موعدها؟ اذكر التاريخ، أو قل «بدون موعد».";
+  return null;
+}
+function taskIntake(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot, plan: SecretaryIntent,
+  key: string, existingDraft: TaskDraft | null, now: number): Result {
+  if (actor.id !== "basem" || actor.role !== "admin") return save(db, event, actor, { status: "denied", reply: "إنشاء المهام وتعيينها من صلاحيات باسم فقط. أقدر أساعدك بتحديث مهامك الحالية." }, [], now);
+  if (plan.intakeMode !== "start" && (plan.intakeMode !== "continue" || !existingDraft)) {
+    db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
+    return save(db, event, actor, { status: "clarify", reply: "ما في مسودة مهمة حالية نكمل عليها. احكيلي المهمة الجديدة المطلوبة من البداية." }, [], now);
+  }
+  const proposed: TaskDraft = { projectId: plan.projectId, title: plan.fields.title, details: plan.fields.details,
+    priority: plan.fields.priority, ownerId: plan.fields.ownerId, dueDate: plan.fields.dueDate };
+  if (plan.intakeMode === "continue" && existingDraft) {
+    for (const field of Object.keys(proposed) as Array<keyof TaskDraft>) {
+      if (proposed[field] === null) Object.assign(proposed, { [field]: existingDraft[field] });
+    }
+  }
+  const draft = availableDraft(proposed, state);
+  // Collecting a new proposal never reuses an older task/send confirmation.
+  db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+  db.prepare("INSERT INTO secretary_task_intake VALUES(?,?,?,?) ON CONFLICT(conversation_key) DO UPDATE SET draft_json=excluded.draft_json,last_event_key=excluded.last_event_key,expires_at=excluded.expires_at")
+    .run(key, JSON.stringify(draft), eventKey(event), now + INTAKE_MS);
+  const question = intakeQuestion(draft, state);
+  const scope = draft.projectId ? ["p:" + draft.projectId] : [];
+  if (question) return save(db, event, actor, { status: "clarify", reply: question }, scope, now);
+  const project = state.projects.find(item => item.id === draft.projectId)!;
+  const owner = state.users.find(item => item.id === draft.ownerId);
+  const token = "T" + randomBytes(3).toString("hex").toUpperCase();
+  const command = { action: "add_task", projectId: draft.projectId, title: draft.title, ...(draft.details ? { details: draft.details } : {}),
+    ownerId: draft.ownerId === "unassigned" ? null : draft.ownerId, priority: draft.priority,
+    dueDate: draft.dueDate === "unscheduled" ? null : draft.dueDate, expectedProjectUpdatedAt: project.updatedAt ?? null, expectedProjectStatus: "active" };
+  const reply = `للتأكيد قبل إنشاء المهمة:\nالمشروع: ${clean(project.name, 240)}\nالمهمة: ${draft.title}${draft.details ? `\nالمطلوب: ${draft.details}` : ""}\nالمسؤول: ${owner ? clean(owner.name, 200) : "بدون مسؤول حاليًا"}\nالأولوية: ${{ red: "🔴 عالية", yellow: "🟡 عادية", green: "🟢 منخفضة" }[draft.priority!]}\nالموعد: ${draft.dueDate === "unscheduled" ? "بدون موعد" : draft.dueDate}\nالحالة عند الإنشاء: مفتوحة بانتظار الاستلام.\n\nلم أنشئ المهمة بعد. اكتب «موافق ${token}» أو رد مباشرة بالموافقة على هذه المعاينة؛ وللتراجع اكتب «إلغاء». التأكيد صالح 10 دقائق.`;
+  if (reply.length > 3700) return save(db, event, actor, { status: "clarify", reply: "تفاصيل المهمة طويلة للمعاينة الكاملة. اختصر التفاصيل حتى أعرضها كلها قبل التأكيد." }, scope, now);
+  db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
+  db.prepare("INSERT INTO secretary_pending VALUES(?,?,?,?,?,?,?)").run(key, token, JSON.stringify(command), fingerprint(state), event.text, event.messageId, now + CONFIRM_MS);
+  log(db, actor, event, "secretary_proposal", { summary: "عرض إنشاء مهمة بعد استكمال بياناتها", proposedCommand: command, confirmationRequired: true }, now);
+  return save(db, event, actor, { status: "confirmation", reply }, scope, now);
+}
+
 function reminder(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot, taskId: unknown, due: unknown, now: number): Result {
   const task = state.tasks.find(t => t.id === taskId);
   if (!task || typeof due !== "number" || !Number.isFinite(due) || due < now + 60_000 || due > now + 90 * 86400_000) return save(db, event, actor, { status: "clarify", reply: "حدد المهمة وموعدًا قادمًا للتذكير بالتاريخ والساعة بتوقيت عمّان/الرياض." }, [], now);
@@ -157,18 +228,30 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const initial = stateFor(db, actor); const previous = lookup(db, event, actor, initial); if (previous) return previous;
   const key = conversation(event, actor); const initialHash = fingerprint(initial);
   const pending = db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined;
+  const storedIntake = intakeRow(db, key);
+  const pendingDraft = pendingTaskDraft(pending, initialHash, now);
+  const draftCandidate = storedIntake && storedIntake.expires_at > now ? JSON.parse(storedIntake.draft_json) : pendingDraft;
+  const taskDraft = draftCandidate && actor.id === "basem" && actor.role === "admin" ? availableDraft(draftCandidate, initial) : null;
   const quote = event.replyToMessageId ? db.prepare("SELECT event_key,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND response_message_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(key, event.replyToMessageId) as { event_key: string; result_json: string; scope_json: string } | undefined : undefined;
   if (event.replyToMessageId && (!quote || !scopeAllowed(JSON.parse(quote.scope_json), initial))) return transaction(db, () => save(db, event, actor, { status: "clarify", reply: "ما قدرت أربط هذا الرد بطلب متاح إلك. اذكر المهمة والتغيير المطلوب بدل الرد على رسالة قديمة أو لشخص آخر." }, [], now));
   const historyRows = conversationHistory(db, key, initial, now);
   const focusResult = quote ? JSON.parse(quote.result_json) : historyRows.length ? JSON.parse(historyRows[historyRows.length - 1].result_json) : null;
   const focusedTask = initial.tasks.find(task => task.id === focusResult?.taskId);
   const focusedTaskId = focusedTask?.id ?? null;
+  if (storedIntake && isCancellation(event.text)) return transaction(db, () => {
+    const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
+    const duplicate = lookup(db, event, freshActor, stateFor(db, freshActor)); if (duplicate) return duplicate;
+    db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
+    db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    return save(db, event, freshActor, { status: "cancelled", reply: "ألغيت مسودة المهمة. لم أنشئ مهمة أو أنفّذ طلبًا سابقًا." }, [], now);
+  });
   if (!pending && isConfirmationAttempt(event.text)) return transaction(db, () => {
     const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
     const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
     const focusSource = quote ?? historyRows[historyRows.length - 1];
     const visibleFocus = focusSource && scopeAllowed(JSON.parse(focusSource.scope_json), state) ? state.tasks.find(task => task.id === focusedTaskId) : undefined;
     if (!AFFIRMATIONS.includes(confirmationText(event.text))) return save(db, event, actor, { status: "clarify", reply: "ما في طلب معلّق مطابق للتأكيد. اذكر التغيير المطلوب لأعرضه عليك من جديد." }, [], now);
+    if (taskDraft) return save(db, event, freshActor, { status: "clarify", reply: intakeQuestion(availableDraft(taskDraft, state), state) || "لم أنشئ المهمة؛ نحتاج معاينة نهائية ورمز تأكيد جديد قبل التنفيذ." }, taskDraft.projectId ? ["p:" + taskDraft.projectId] : [], now);
     return save(db, event, freshActor, { status: "summary", reply: `تمام يا ${clean(freshActor.name, 60)}، أنا معك.${visibleFocus ? ` نكمل على «${clean(visibleFocus.title, 120)}»؛ احكيلي شو المطلوب.` : " احكيلي كيف أقدر أساعدك."}`, ...(visibleFocus ? { taskId: visibleFocus.id } : {}) }, visibleFocus ? ["t:" + visibleFocus.id, "p:" + visibleFocus.projectId] : [], now);
   });
   if (pending && (isConfirmationAttempt(event.text) || isCancellation(event.text))) {
@@ -199,7 +282,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const history = boundedHistory(historyRows, quote);
   const canMessageTeam = actor.id === "basem" && actor.role === "admin" && event.groupId === null;
   const pendingCommand = canMessageTeam && pending && pending.expires_at > now ? JSON.parse(pending.command_json) : null;
-  const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId,
+  const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId, taskDraft,
     canMessageTeam, messageRecipients: canMessageTeam ? getSecretaryOutboxRecipients(db, config).map(user => ({ id: user.userId, name: user.name })) : [],
     pendingMessagePreview: pendingCommand?.action === "message_team" && typeof pendingCommand.text === "string" && Array.isArray(pendingCommand.recipientIds) ? { text: pendingCommand.text, recipientIds: pendingCommand.recipientIds } : null,
     tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status })),
@@ -217,6 +300,12 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
     const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
     if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل أثناء قراءة رسالتك. ما عدّلتها؛ أعد الطلب لأراجع آخر وضع." }, [], now);
+    if (hash(intakeRow(db, key) ?? null) !== hash(storedIntake ?? null)) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت مسودة المهمة أثناء قراءة رسالتك. لم أنشئ شيئًا؛ أعد آخر جواب لنكمل على التفاصيل الحالية." }, [], now);
+    if ((plan.kind === "task_draft" || pendingDraft) && hash(db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) ?? null) !== hash(pending ?? null)) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت معاينة التأكيد أثناء قراءة رسالتك. لم أنشئ شيئًا؛ أعد التصحيح على المعاينة الحالية." }, [], now);
+    if (plan.kind === "task_draft") return taskIntake(db, event, freshActor, state, plan, key, taskDraft, now);
+    // Only an explicit task_draft plan may continue intake; unrelated subjects cannot revive it later.
+    if (storedIntake) db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
+    if (pendingDraft) db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
     if (plan.kind === "message_status") {
       try {
         const batch = getSecretaryOutboxStatus(db, { actor: freshActor, origin: { senderNumber: event.senderNumber, groupId: event.groupId } }, config);

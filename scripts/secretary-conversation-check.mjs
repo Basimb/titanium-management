@@ -24,15 +24,24 @@ const cases = [
   { text:'ارسل للموظف الأول فقط على الخاص: أهلا وسهلا', kinds:['message_team'],
     canMessageTeam:true, messageRecipients:[{id:'synthetic-one',name:'الموظف الأول'},{id:'synthetic-two',name:'الموظف الثاني'}],
     expectedRecipients:['synthetic-one'], expectedBody:'أهلا وسهلا' },
+  { text:'أضف مهمة تجهيز التقرير الشهري بمشروع الاختبار، أولوية خضرا، بدون مسؤول حاليًا وبدون موعد', kinds:['task_draft'],
+    expectedPriority:'green', expectedMode:'start' },
+  { text:'خلي أولوية التقرير التجريبي خضرا', kinds:['command'], action:'edit_task', expectedPriority:'green' },
+  { text:'سجل تحديث على التقرير التجريبي: أنجزت 60٪ وبستنى رد المورد', kinds:['command','clarify'], action:'comment' },
+  { text:'أصفر', kinds:['task_draft'], expectedPriority:'yellow', expectedMode:'continue',
+    taskDraft:{projectId:'synthetic-project',title:'تجهيز تقرير تجريبي',details:null,priority:null,ownerId:'unassigned',dueDate:'unscheduled'},
+    history:[{role:'user',content:'أضف مهمة تجهيز تقرير تجريبي بمشروع الاختبار بدون مسؤول وبدون موعد'},
+      {role:'assistant',content:'شو أولويتها: أحمر عالية، أصفر عادية، ولا أخضر منخفضة؟'}] },
+  { text:'أضف مهمة تجهيز التقرير الشهري', kinds:['task_draft'], expectedMode:'start' },
 ];
 const index = Number(process.argv.find(a=>a.startsWith('--case='))?.slice(7));
 if (!Number.isInteger(index) || !cases[index]) {
-  console.log(JSON.stringify({ok:false,error:'select_synthetic_case_0_to_7'}));
+  console.log(JSON.stringify({ok:false,error:'select_synthetic_case_0_to_12'}));
   process.exitCode=1;
 } else {
   try {
     const settings=readTeamChatSettings(); const chosen=cases[index];
-    const {kinds,action,taskId,expectedRecipients,expectedBody,...values}=chosen;
+    const {kinds,action,taskId,expectedRecipients,expectedBody,expectedPriority,expectedMode,...values}=chosen;
     let httpStatus=null;
     const plan=await inferSecretaryIntent({...base,...values}, {
       apiKey:settings.GROQ_API_KEY,model:settings.GROQ_MODEL,
@@ -43,10 +52,13 @@ if (!Number.isInteger(index) || !cases[index]) {
       && (!expectedRecipients||JSON.stringify(plan.recipientIds)===JSON.stringify(expectedRecipients)
         || (expectedRecipients.length===1 && expectedRecipients[0]==='all-team'
           && JSON.stringify([...plan.recipientIds].sort())===JSON.stringify(values.messageRecipients.map(user=>user.id).sort())))
-      && (!expectedBody||plan.fields.body===expectedBody);
+      && (!expectedBody||plan.fields.body===expectedBody)
+      && (!expectedPriority||plan.fields.priority===expectedPriority)
+      && (!expectedMode||plan.intakeMode===expectedMode);
     console.log(JSON.stringify({case:index,ok,kind:plan.kind,action:plan.action,taskId:plan.taskId,httpStatus,
       // All inputs are fixed synthetic values; prose helps review real language quality.
-      reply:plan.message,...(expectedRecipients?{recipientIds:plan.recipientIds,body:plan.fields.body}:{})}));
+      reply:plan.message,...(expectedRecipients?{recipientIds:plan.recipientIds,body:plan.fields.body}:{}),
+      ...((expectedMode||expectedPriority)?{intakeMode:plan.intakeMode,projectId:plan.projectId,fields:plan.fields}:{})}));
     if(!ok)process.exitCode=1;
   } catch {
     console.log(JSON.stringify({case:index,ok:false,error:'synthetic_provider_check_unavailable'}));
