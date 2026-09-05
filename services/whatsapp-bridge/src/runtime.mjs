@@ -4,6 +4,7 @@ import { inspectGroupMembership, boundedPlainText, groupJid, withAbortSignal } f
 import { processControlJob } from './control.mjs';
 import { selectVoiceIncoming } from './voice.mjs';
 import { createPollChoices } from './polls.mjs';
+import { createPrivateOutboxTransport } from './private-transport.mjs';
 
 function withDeadline(work) {
   let timer;
@@ -18,7 +19,7 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   makeCacheableSignalKeyStore, DisconnectReason, logger, onStop = () => {}, output = console,
   now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch, otpQueue,
   control, isActiveNumber = () => false, secretaryJobs, secretaryOutbox, transcribeVoice,
-  proto, generateWAMessageContent, decryptPollVote, normalizeMessageContent }) {
+  proto, generateWAMessageContent, generateWAMessage, decryptPollVote, normalizeMessageContent }) {
   let socket;
   let ready = false;
   let stopped = false;
@@ -35,6 +36,9 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   const groupEpoch = new Map();
   const polls = proto && generateWAMessageContent && decryptPollVote
     ? createPollChoices({ store, config, proto, generateWAMessageContent, decryptPollVote, normalizeMessageContent, now }) : null;
+  const privateTransport = secretaryOutbox && proto && generateWAMessage
+    ? createPrivateOutboxTransport({ store, config, proto, generateWAMessage, normalizeJid: jidNormalizedUser,
+      authorize: isActiveNumber, recordUpdate: update => secretaryOutbox.recordTransportUpdate(update), now }) : null;
 
   function invalidateGroup(jid) {
     if (!config.allowedGroups.has(jid) && !groupEpoch.has(jid)) return;
@@ -101,7 +105,9 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       auth: { creds: auth.state.creds, keys: makeCacheableSignalKeyStore(auth.state.keys, logger) },
       logger, markOnlineOnConnect: false, syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      getMessage: async key => polls?.outgoingMessage(key) || store.outgoingMessage(key),
+      getMessage: async key => privateTransport?.isTracked(key?.id)
+        ? privateTransport.getMessage(key, { socket: current, isCurrent: () => ready && !stopped && current === socket })
+        : polls?.outgoingMessage(key) || store.outgoingMessage(key),
       cachedGroupMetadata: async jid => {
         const cached = groupCache.get(jid);
         return cached && cached.expires > now() ? cached.metadata : undefined;
@@ -109,6 +115,7 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       connectTimeoutMs: 30_000,
     });
     socket = current;
+    privateTransport?.attach(current, () => ready && !stopped && current === socket);
     let connectionEpoch = 0;
     const identity = {
       normalizeJid: jidNormalizedUser,
@@ -202,6 +209,14 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
     if (privateOnly && (typeof to !== 'string' || !/^[1-9]\d{7,14}@s\.whatsapp\.net$/.test(to))) {
       throw new Error('secretary_private_destination_required');
     }
+    if (privateOnly) {
+      if (!privateTransport || typeof secretaryOutbox.recordTransportUpdate !== 'function') {
+        throw Object.assign(new Error('transport_preflight_rejected'), { code: 'transport_preflight_rejected', definitelyNotSent: true });
+      }
+      return privateTransport.send({ to, text: reply, messageId, signal }, {
+        socket: current, isCurrent: () => ready && !stopped && current === socket,
+      });
+    }
     if (groupJid(to)) { await withAbortSignal(() => sendGroup(to, reply, messageId, signal), signal); return; }
     const number = typeof to === 'string' ? to.replace(/@s\.whatsapp\.net$/, '') : '';
     if (!/^[1-9]\d{7,14}$/.test(number) || number === config.botNumber || !config.allowedNumbers.has(number)) {
@@ -231,7 +246,7 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       if (result.status !== 'idle') {
         preferOutbox = kind !== 'outbox';
         const label = kind === 'outbox' ? 'outbox' : 'delivery';
-        const status = result.status === 'sent' ? 'sent' : result.status === 'uncertain' ? 'uncertain' : 'failed';
+        const status = result.status === 'sent' ? 'sent' : result.status === 'submitted' ? 'submitted' : result.status === 'uncertain' ? 'uncertain' : 'failed';
         output.info(`Titanium secretary ${label}: ${status}.`);
         return true;
       }

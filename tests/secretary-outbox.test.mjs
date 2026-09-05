@@ -120,20 +120,20 @@ test("each recipient gets the same exact preview text privately and owner receiv
   const f = fixture(t), p = f.preview({ text: "نص دقيق\n*للجميع*" }); f.confirm(p);
   const jobs = f.jobs(), sent = [];
   const send = async message => { assert.equal(f.db.isTransaction, false); assert.ok(message.signal instanceof AbortSignal); sent.push(message); };
-  assert.equal((await jobs.deliverNext(send)).status, "sent"); assert.equal((await jobs.deliverNext(send)).status, "sent");
-  assert.equal((await jobs.deliverNext(send)).status, "sent"); assert.equal((await jobs.deliverNext(noSend)).status, "idle");
+  assert.equal((await jobs.deliverNext(send)).status, "submitted"); assert.equal((await jobs.deliverNext(send)).status, "submitted");
+  assert.equal((await jobs.deliverNext(send)).status, "submitted"); assert.equal((await jobs.deliverNext(noSend)).status, "idle");
   assert.deepEqual(new Set(sent.slice(0, 2).map(row => row.to)), new Set(["12025550101@s.whatsapp.net", "12025550102@s.whatsapp.net"]));
   assert.ok(sent.slice(0, 2).every(row => row.text === p.text)); assert.ok(sent.every(row => !row.to.endsWith("@g.us")));
-  assert.equal(sent[2].to, "12025550103@s.whatsapp.net"); assert.match(sent[2].text, /قُبل الإرسال.*2 من 2/); assert.match(sent[2].text, /لا يؤكد وصول الرسالة أو قراءتها/);
-  assert.match(sent[2].text, /محمود: قُبل الإرسال/); assert.match(sent[2].text, /ليلى: قُبل الإرسال/); assert.ok(sent[2].text.length <= 4000);
-  assert.equal(f.status().state, "sent"); assert.equal(f.status().acceptedCount, 2);
+  assert.equal(sent[2].to, "12025550103@s.whatsapp.net"); assert.match(sent[2].text, /خادم واتساب: 0 من 2/); assert.match(sent[2].text, /لا يؤكد وصول الرسالة أو قراءتها/);
+  assert.match(sent[2].text, /محمود: سُلّمت للنقل/); assert.match(sent[2].text, /ليلى: سُلّمت للنقل/); assert.ok(sent[2].text.length <= 4000);
+  assert.equal(f.status().state, "submitted"); assert.equal(f.status().acceptedCount, 0); assert.equal(f.status().submittedCount, 2);
 });
 
 test("recipient remap after confirmation fails safely and completion reports the failure without retry", async t => {
   const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] }));
   f.config({ enabled: true, contacts: baseContacts.map(row => row.userId === "a" ? { ...row, number: "12025550109" } : row) });
   const jobs = f.jobs(); assert.equal((await jobs.deliverNext(noSend)).status, "failed");
-  let receipt; assert.equal((await jobs.deliverNext(async message => { receipt = message; })).status, "sent");
+  let receipt; assert.equal((await jobs.deliverNext(async message => { receipt = message; })).status, "submitted");
   assert.equal(receipt.to, "12025550103@s.whatsapp.net"); assert.match(receipt.text, /تعذّر الإرسال: 1/);
   assert.match(receipt.text, /محمود: تعذّر الإرسال/);
   assert.equal((await jobs.deliverNext(noSend)).status, "idle"); assert.equal(f.status().failedCount, 1);
@@ -179,7 +179,7 @@ test("deadline aborts an unresponsive sender and late success cannot change unce
 test("interrupted sending leases become uncertain without being sent again", async t => {
   const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] }));
   f.db.prepare("UPDATE secretary_outbox_deliveries SET state='sending',sending_at=?").run(f.now); f.tick(60_000);
-  const sent = []; const jobs = f.jobs(); assert.equal((await jobs.deliverNext(async message => { sent.push(message); })).status, "sent");
+  const sent = []; const jobs = f.jobs(); assert.equal((await jobs.deliverNext(async message => { sent.push(message); })).status, "submitted");
   assert.equal(rows(f)[0].state, "uncertain"); assert.equal(sent.length, 1); assert.equal(sent[0].to, "12025550103@s.whatsapp.net");
   assert.equal((await jobs.deliverNext(noSend)).status, "idle");
 });
@@ -201,7 +201,7 @@ test("independent workers and SQLite handles claim one send once while awaiting 
   let complete, sends = 0;
   const inFlight = one.deliverNext(() => { sends++; return new Promise(resolve => { complete = resolve; }); });
   assert.equal((await two.deliverNext(noSend)).status, "idle"); assert.equal((await one.deliverNext(noSend)).status, "idle");
-  complete(); assert.equal((await inFlight).status, "sent"); assert.equal(sends, 1);
+  complete(); assert.equal((await inFlight).status, "submitted"); assert.equal(sends, 1);
 });
 
 test("outer rollback and failed queue insertion leave no partial delivery batch", t => {
@@ -272,4 +272,107 @@ test("queued backlog is bounded across hourly quota windows", t => {
   for (let i = 0; i < 10; i++) f.confirm(f.preview());
   assert.equal(rows(f).length, 200); f.tick(60 * 60_000);
   denied(() => f.confirm(f.preview({ recipientIds: ["a"] })), "outbox_limit"); assert.equal(rows(f).length, 200);
+});
+
+test("callback success and even a returned ACK label never create server acknowledgment evidence", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] }));
+  const jobs = f.jobs(); assert.equal((await jobs.deliverNext(async () => ({ status: "server_ack", at: f.now }))).status, "submitted");
+  assert.equal(rows(f)[0].state, "submitted"); assert.equal(rows(f)[0].outcome_code, "transport_submitted");
+  const status = f.status(); assert.equal(status.acceptedCount, 0); assert.equal(status.deliveredCount, 0); assert.equal(status.readCount, 0); assert.equal(status.submittedCount, 1);
+  assert.deepEqual(status.recipients[0].evidence, { serverAckAt: null, deliveredAt: null, readAt: null, errorAt: null, errorCode: null });
+});
+
+test("unknown, not-started, unconfirmed and forged-destination transport events are ignored", async t => {
+  const f = fixture(t), p = f.preview({ recipientIds: ["a"] }); const jobs = f.jobs();
+  const receiptId = f.db.prepare("SELECT receipt_message_id FROM secretary_outbox_batches").get().receipt_message_id;
+  assert.equal(jobs.getTransportBinding(receiptId), null);
+  assert.equal(jobs.recordTransportUpdate({ messageId: receiptId, to: "12025550103@s.whatsapp.net", status: "read", at: f.now }).status, "ignored");
+  f.confirm(p); const id = rows(f)[0].message_id;
+  assert.equal(jobs.getTransportBinding(id), null);
+  assert.equal(jobs.recordTransportUpdate({ messageId: id, to: "12025550101@s.whatsapp.net", status: "server_ack", at: f.now }).status, "ignored");
+  await jobs.deliverNext(async () => {});
+  for (const to of ["12025550102@s.whatsapp.net", "12025550101", "+12025550101@s.whatsapp.net", "12025550101@lid", "123@g.us"]) {
+    assert.equal(jobs.recordTransportUpdate({ messageId: id, to, status: "read", at: f.now }).status, "ignored");
+  }
+  assert.equal(jobs.recordTransportUpdate({ messageId: "unknown", to: "12025550101@s.whatsapp.net", status: "read", at: f.now }).status, "ignored");
+  assert.equal(f.db.prepare("SELECT count(*) n FROM secretary_outbox_transport").get().n, 0);
+});
+
+test("real ACK received during sending survives callback completion and no read or delivery is invented", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] })); const jobs = f.jobs();
+  await jobs.deliverNext(async message => {
+    assert.deepEqual(jobs.getTransportBinding(message.messageId), { messageId: message.messageId, to: message.to, kind: "delivery" });
+    assert.deepEqual(jobs.recordTransportUpdate({ messageId: message.messageId, to: message.to, status: "server_ack", at: f.now }), { status: "recorded", evidenceStatus: "server_ack" });
+  });
+  const status = f.status(); assert.equal(status.acceptedCount, 1); assert.equal(status.deliveredCount, 0); assert.equal(status.readCount, 0);
+  assert.equal(status.recipients[0].state, "server_ack"); assert.equal(status.recipients[0].submissionState, "submitted"); assert.equal(status.recipients[0].evidence.serverAckAt, f.now);
+});
+
+test("late read after uncertain changes evidence only and cannot enqueue, retry or notify", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] }));
+  f.db.exec("UPDATE secretary_outbox_batches SET receipt_state=NULL"); const jobs = f.jobs(); let message;
+  assert.equal((await jobs.deliverNext(async value => { message = value; throw Error("unknown relay result"); })).status, "uncertain");
+  const before = { ...rows(f)[0] }; f.tick(1000);
+  assert.equal(jobs.recordTransportUpdate({ messageId: message.messageId, to: message.to, status: "read", at: f.now }).evidenceStatus, "read");
+  assert.deepEqual({ ...rows(f)[0] }, before); assert.equal(f.db.prepare("SELECT receipt_state FROM secretary_outbox_batches").get().receipt_state, null);
+  const status = f.status(); assert.equal(status.acceptedCount, 1); assert.equal(status.deliveredCount, 1); assert.equal(status.readCount, 1); assert.equal(status.recipients[0].submissionState, "uncertain");
+  assert.equal(status.recipients[0].evidence.serverAckAt, null); assert.equal(status.recipients[0].evidence.deliveredAt, null);
+  assert.equal((await jobs.deliverNext(noSend)).status, "idle"); assert.equal(rows(f).length, 1);
+});
+
+test("out-of-order ACK/error and duplicate events never downgrade read evidence", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] })); const jobs = f.jobs(); await jobs.deliverNext(async () => {});
+  const id = rows(f)[0].message_id, to = "12025550101@s.whatsapp.net"; f.tick(2000);
+  jobs.recordTransportUpdate({ messageId: id, to, status: "read", at: f.now });
+  for (const status of ["server_ack", "error", "delivered", "read", "server_ack"]) {
+    assert.equal(jobs.recordTransportUpdate({ messageId: id, to, status, at: f.now - 1000, ...(status === "error" ? { errorCode: "SECRET 12025550101 raw provider message" } : {}) }).evidenceStatus, "read");
+  }
+  const result = f.status(); assert.equal(result.recipients[0].state, "read"); assert.equal(result.acceptedCount, 1); assert.equal(result.readCount, 1);
+  assert.equal(result.recipients[0].evidence.errorCode, "transport_error"); assert.doesNotMatch(JSON.stringify(result), /SECRET|12025550101|raw provider/);
+  assert.equal(f.db.prepare("SELECT count(*) n FROM secretary_outbox_transport").get().n, 1);
+});
+
+test("legacy sent and uncertain rows remain unchanged and never count as ACK without new evidence", async t => {
+  const f = fixture(t); f.confirm(f.preview());
+  f.db.prepare("UPDATE secretary_outbox_deliveries SET state=CASE recipient_id WHEN 'a' THEN 'sent' ELSE 'uncertain' END,sending_at=?,finished_at=?,outcome_code='accepted'").run(f.now, f.now);
+  f.db.exec("UPDATE secretary_outbox_batches SET state='uncertain',receipt_state='sent'; DROP TABLE secretary_outbox_transport");
+  const before = rows(f).map(row => ({ ...row })); migrateSecretaryOutbox(f.db); const jobs = f.jobs();
+  const result = f.status(); assert.equal(result.acceptedCount, 0); assert.equal(result.submittedCount, 1); assert.equal(result.uncertainCount, 1);
+  const legacy = result.recipients.find(row => row.userId === "a"); assert.equal(legacy.state, "submitted"); assert.equal(legacy.legacySubmission, true);
+  assert.deepEqual(rows(f).map(row => ({ ...row })), before); assert.equal((await jobs.deliverNext(noSend)).status, "idle");
+});
+
+test("confirmed preflight failure is failed, not uncertain, and cannot acquire later forged proof", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] })); const jobs = f.jobs();
+  const error = Object.assign(Error("private details must not escape"), { definitelyNotSent: true, code: "recipient_devices_unavailable" });
+  assert.equal((await jobs.deliverNext(async () => { throw error; })).status, "failed");
+  const row = rows(f)[0]; assert.equal(row.state, "failed"); assert.equal(row.outcome_code, "transport_preflight_rejected"); assert.equal(jobs.getTransportBinding(row.message_id), null);
+  assert.equal(jobs.recordTransportUpdate({ messageId: row.message_id, to: "12025550101@s.whatsapp.net", status: "server_ack", at: f.now }).status, "ignored");
+});
+
+test("owner completion receipt proof never promotes staff delivery or reading", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] })); const jobs = f.jobs(); await jobs.deliverNext(async () => {});
+  await jobs.deliverNext(async message => {
+    assert.equal(jobs.getTransportBinding(message.messageId).kind, "receipt");
+    assert.equal(jobs.recordTransportUpdate({ messageId: message.messageId, to: "12025550101@s.whatsapp.net", status: "read", at: f.now }).status, "ignored");
+    assert.equal(jobs.recordTransportUpdate({ messageId: message.messageId, to: message.to, status: "read", at: f.now }).status, "recorded");
+  });
+  assert.equal(f.status().acceptedCount, 0); assert.equal(f.status().deliveredCount, 0); assert.equal(f.status().readCount, 0); assert.equal((await jobs.deliverNext(noSend)).status, "idle");
+});
+
+test("a remapped current phone cannot receive old-message proof and tampered frozen rows fail closed", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] })); const jobs = f.jobs(); await jobs.deliverNext(async () => {}); const id = rows(f)[0].message_id;
+  f.config({ ...f.cfg, contacts: baseContacts.map(contact => contact.userId === "a" ? { ...contact, number: "12025550109" } : contact) });
+  assert.equal(jobs.recordTransportUpdate({ messageId: id, to: "12025550109@s.whatsapp.net", status: "read", at: f.now }).status, "ignored");
+  assert.equal(jobs.recordTransportUpdate({ messageId: id, to: "12025550101@s.whatsapp.net", status: "delivered", at: f.now }).status, "recorded");
+  f.db.exec("UPDATE secretary_outbox_deliveries SET recipient_phone='12025550109'"); assert.equal(jobs.getTransportBinding(id), null);
+  assert.equal(jobs.recordTransportUpdate({ messageId: id, to: "12025550109@s.whatsapp.net", status: "read", at: f.now }).status, "ignored");
+});
+
+test("invalid evidence times/status/extra fields do not persist and metadata participates in outer rollback", async t => {
+  const f = fixture(t); f.confirm(f.preview({ recipientIds: ["a"] })); const jobs = f.jobs(); await jobs.deliverNext(async () => {});
+  const base = { messageId: rows(f)[0].message_id, to: "12025550101@s.whatsapp.net", status: "server_ack", at: f.now };
+  for (const extra of [{ at: f.now + 300001 }, { at: f.now - 1001 }, { at: NaN }, { status: "sent" }, { extra: "override" }]) assert.equal(jobs.recordTransportUpdate({ ...base, ...extra }).status, "ignored");
+  f.db.exec("BEGIN IMMEDIATE"); assert.equal(jobs.recordTransportUpdate(base).status, "recorded"); f.db.exec("ROLLBACK");
+  assert.equal(f.db.prepare("SELECT count(*) n FROM secretary_outbox_transport").get().n, 0); assert.equal(f.status().acceptedCount, 0);
 });

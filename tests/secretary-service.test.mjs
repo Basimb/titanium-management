@@ -364,7 +364,7 @@ test('owner private team message previews exact recipients and text then queues 
  assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
  assert.equal(f.db.prepare('SELECT count(*) n FROM comments').get().n,0);
  const status=await f.run(emptySecretaryIntent('message_status'),{...manager,text:'شو صار بالإرسال؟'});
- assert.match(status.reply,/خالد|شادي/);assert.match(status.reply,/لا يعني أن الموظف قرأ/);assert.doesNotMatch(status.reply,/1202555010/);
+ assert.match(status.reply,/خالد|شادي/);assert.match(status.reply,/النقل وحده لا يثبت الوصول أو القراءة/);assert.match(status.reply,/إقرار خادم واتساب: 0/);assert.doesNotMatch(status.reply,/1202555010/);
 });
 
 test('team sends are denied to members and group-origin requests',async t=>{

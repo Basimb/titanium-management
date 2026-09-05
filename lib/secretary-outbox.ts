@@ -7,15 +7,22 @@ export type SecretaryOutboxConfig = { enabled: boolean; contacts: readonly Conta
 type Origin = { senderNumber: string; groupId?: string | null };
 type Identity = { actor: ChatUser; origin: Origin };
 type Recipient = { userId: string; name: string; phone: string };
-type DeliveryState = "queued" | "sending" | "sent" | "failed" | "uncertain";
-type BatchState = "preview" | "queued" | "sent" | "failed" | "uncertain";
+type DeliveryState = "queued" | "sending" | "sent" | "submitted" | "failed" | "uncertain";
+export type SecretaryTransportStatus = "server_ack" | "delivered" | "read" | "error";
+type PublicDeliveryState = Exclude<DeliveryState, "sent"> | SecretaryTransportStatus;
+type BatchState = "preview" | "queued" | "sent" | "submitted" | "server_ack" | "delivered" | "read" | "failed" | "uncertain";
+type Evidence = { serverAckAt: number | null; deliveredAt: number | null; readAt: number | null; errorAt: number | null; errorCode: string | null };
+export type SecretaryOutboxRecipientStatus = { userId: string; name: string; state: PublicDeliveryState; submissionState: DeliveryState; legacySubmission: boolean; evidence: Evidence };
 type Batch = { id: string; source_key: string; payload_hash: string; source_message_id: string; requester_id: string; requester_name: string;
   requester_phone: string; body: string; recipients_json: string; state: BatchState; created_at: number; expires_at: number;
   confirmed_at: number | null; confirmation_key: string | null; confirmation_message_id: string | null;
   receipt_state: DeliveryState | null; receipt_sending_at: number | null; receipt_message_id: string };
 export type SecretaryOutboxPreview = { batchId: string; state: BatchState; text: string; recipients: Array<{ userId: string; name: string }>; expiresAt: number };
 export type SecretaryOutboxStatus = { batchId: string; state: BatchState; recipientCount: number; acceptedCount: number;
-  failedCount: number; uncertainCount: number; pendingCount: number; recipients: Array<{ userId: string; name: string; state: DeliveryState }> };
+  submittedCount: number; deliveredCount: number; readCount: number;
+  failedCount: number; uncertainCount: number; pendingCount: number; recipients: SecretaryOutboxRecipientStatus[] };
+export type SecretaryTransportBinding = { messageId: string; to: string; kind: "delivery" | "receipt" };
+export type SecretaryTransportUpdate = { messageId: string; to: string; status: SecretaryTransportStatus; at: number; errorCode?: string };
 export class SecretaryOutboxError extends Error {
   readonly status: number; readonly code: string;
   constructor(status: number, code: string, message: string) { super(message); this.name = "SecretaryOutboxError"; this.status = status; this.code = code; }
@@ -80,13 +87,60 @@ export function migrateSecretaryOutbox(db: DatabaseSync) {
     id TEXT PRIMARY KEY,batch_id TEXT NOT NULL REFERENCES secretary_outbox_batches(id),recipient_id TEXT NOT NULL,recipient_name TEXT NOT NULL,
     recipient_phone TEXT NOT NULL,message_id TEXT NOT NULL UNIQUE,state TEXT NOT NULL DEFAULT 'queued',created_at INTEGER NOT NULL,
     sending_at INTEGER,finished_at INTEGER,outcome_code TEXT,UNIQUE(batch_id,recipient_id));
-    CREATE INDEX IF NOT EXISTS secretary_outbox_ready ON secretary_outbox_deliveries(state,created_at,id);`));
+    CREATE INDEX IF NOT EXISTS secretary_outbox_ready ON secretary_outbox_deliveries(state,created_at,id);
+    CREATE TABLE IF NOT EXISTS secretary_outbox_transport (
+    message_id TEXT PRIMARY KEY,to_jid TEXT NOT NULL,server_ack_at INTEGER,delivered_at INTEGER,read_at INTEGER,
+    error_at INTEGER,error_code TEXT,updated_at INTEGER NOT NULL);`));
 }
 function publicPreview(batch: Batch): SecretaryOutboxPreview {
-  return { batchId: batch.id, state: batch.state, text: batch.body, recipients: frozenRecipients(batch).map(({ userId, name }) => ({ userId, name })), expiresAt: batch.expires_at };
+  return { batchId: batch.id, state: batch.state === "sent" ? "submitted" : batch.state, text: batch.body, recipients: frozenRecipients(batch).map(({ userId, name }) => ({ userId, name })), expiresAt: batch.expires_at };
 }
 function batchById(db: DatabaseSync, id: string): Batch {
   return db.prepare("SELECT * FROM secretary_outbox_batches WHERE id=?").get(id) as Batch ?? fail(404, "missing", "طلب الإرسال غير موجود");
+}
+function transportBinding(db: DatabaseSync, messageId: unknown): (SecretaryTransportBinding & { sendingAt: number }) | null {
+  if (typeof messageId !== "string" || !/^[a-zA-Z0-9_-]{1,200}$/.test(messageId)) return null;
+  const delivery = db.prepare("SELECT d.recipient_id,d.recipient_name,d.recipient_phone,d.sending_at,d.state,b.recipients_json FROM secretary_outbox_deliveries d JOIN secretary_outbox_batches b ON b.id=d.batch_id WHERE d.message_id=? AND b.confirmed_at IS NOT NULL").get(messageId);
+  if (delivery && delivery.sending_at !== null && !["queued", "failed"].includes(String(delivery.state))) {
+    let frozen: Recipient[]; try { frozen = JSON.parse(String(delivery.recipients_json)); } catch { return null; }
+    if (!Array.isArray(frozen) || !frozen.some(item => item.userId === delivery.recipient_id && item.name === delivery.recipient_name && item.phone === delivery.recipient_phone)) return null;
+    return { messageId, to: `${delivery.recipient_phone}@s.whatsapp.net`, kind: "delivery", sendingAt: Number(delivery.sending_at) };
+  }
+  const receipt = db.prepare("SELECT requester_phone,receipt_sending_at,receipt_state FROM secretary_outbox_batches WHERE receipt_message_id=? AND confirmed_at IS NOT NULL").get(messageId);
+  return receipt && receipt.receipt_sending_at !== null && !["queued", "failed"].includes(String(receipt.receipt_state))
+    ? { messageId, to: `${receipt.requester_phone}@s.whatsapp.net`, kind: "receipt", sendingAt: Number(receipt.receipt_sending_at) } : null;
+}
+function evidenceState(evidence: Evidence): SecretaryTransportStatus | null {
+  return evidence.readAt !== null ? "read" : evidence.deliveredAt !== null ? "delivered" : evidence.serverAckAt !== null ? "server_ack" : evidence.errorAt !== null ? "error" : null;
+}
+function readEvidence(db: DatabaseSync, messageId: string): Evidence {
+  const row = db.prepare("SELECT server_ack_at AS serverAckAt,delivered_at AS deliveredAt,read_at AS readAt,error_at AS errorAt,error_code AS errorCode FROM secretary_outbox_transport WHERE message_id=?").get(messageId);
+  return row as Evidence ?? { serverAckAt: null, deliveredAt: null, readAt: null, errorAt: null, errorCode: null };
+}
+const SAFE_TRANSPORT_ERRORS = new Set(["recipient_devices_unavailable", "transport_preflight_rejected", "transport_rejected", "message_error", "server_error", "transport_error"]);
+function recordTransportUpdate(db: DatabaseSync, update: SecretaryTransportUpdate, now: number): { status: "recorded" | "ignored"; evidenceStatus?: SecretaryTransportStatus } {
+  if (!update || typeof update !== "object" || Array.isArray(update) || Object.keys(update).some(key => !["messageId", "to", "status", "at", "errorCode"].includes(key))
+    || !["server_ack", "delivered", "read", "error"].includes(update.status) || typeof update.to !== "string" || !/^[1-9]\d{7,14}@s\.whatsapp\.net$/.test(update.to)
+    || !Number.isSafeInteger(update.at) || update.at < 0 || update.at > now + 300_000) return { status: "ignored" };
+  return atomic(db, () => {
+    const binding = transportBinding(db, update.messageId);
+    if (!binding || binding.to !== update.to || update.at < binding.sendingAt - 1000) return { status: "ignored" };
+    const prior = db.prepare("SELECT to_jid FROM secretary_outbox_transport WHERE message_id=?").get(update.messageId);
+    if (prior && prior.to_jid !== update.to) return { status: "ignored" };
+    const evidence = readEvidence(db, update.messageId);
+    const field = { server_ack: "serverAckAt", delivered: "deliveredAt", read: "readAt", error: "errorAt" }[update.status] as "serverAckAt" | "deliveredAt" | "readAt" | "errorAt";
+    evidence[field] = evidence[field] === null ? update.at : Math.min(evidence[field]!, update.at);
+    if (update.status === "error" && evidence.errorCode === null) evidence.errorCode = SAFE_TRANSPORT_ERRORS.has(update.errorCode || "") ? update.errorCode! : "transport_error";
+    db.prepare("INSERT INTO secretary_outbox_transport VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET server_ack_at=excluded.server_ack_at,delivered_at=excluded.delivered_at,read_at=excluded.read_at,error_at=excluded.error_at,error_code=excluded.error_code,updated_at=MAX(secretary_outbox_transport.updated_at,excluded.updated_at)")
+      .run(update.messageId, update.to, evidence.serverAckAt, evidence.deliveredAt, evidence.readAt, evidence.errorAt, evidence.errorCode, now);
+    // Evidence never changes submission state, queue membership or completion-receipt state.
+    return { status: "recorded", evidenceStatus: evidenceState(evidence)! };
+  });
+}
+export function secretaryOutboxDeliveryLabel(recipient: SecretaryOutboxRecipientStatus): string {
+  const labels: Record<PublicDeliveryState, string> = { queued: "بانتظار محاولة الإرسال", sending: "تجري محاولة الإرسال", submitted: recipient.legacySubmission ? "تسليم قديم للنقل بلا إيصال واتساب موثّق" : "سُلّمت للنقل؛ لا يوجد إيصال واتساب بعد",
+    server_ack: "ورد إقرار خادم واتساب؛ وصولها للجهاز غير مؤكد", delivered: "ورد إيصال وصول إلى جهاز المستلم", read: "ورد إيصال قراءة", error: "ورد خطأ من النقل", failed: "تعذّر الإرسال قبل النقل", uncertain: "نتيجة المحاولة غير مؤكدة؛ لن نكررها تلقائيًا" };
+  return labels[recipient.state] + (recipient.evidence.errorAt !== null && ["server_ack", "delivered", "read"].includes(recipient.state) ? "؛ ويوجد خطأ نقل مسجّل أيضًا" : "");
 }
 function validateFrozen(db: DatabaseSync, batch: Batch, config: SecretaryOutboxConfig, recipient?: Recipient | null): boolean {
   try {
@@ -128,11 +182,16 @@ export function createSecretaryOutboxPreview(db: DatabaseSync, input: Identity &
   });
 }
 function summarize(db: DatabaseSync, batch: Batch): SecretaryOutboxStatus {
-  const rows = db.prepare("SELECT recipient_id AS userId,recipient_name AS name,state FROM secretary_outbox_deliveries WHERE batch_id=? ORDER BY recipient_name,recipient_id").all(batch.id) as SecretaryOutboxStatus["recipients"];
+  const raw = db.prepare("SELECT recipient_id AS userId,recipient_name AS name,state,message_id FROM secretary_outbox_deliveries WHERE batch_id=? ORDER BY recipient_name,recipient_id").all(batch.id) as Array<{ userId: string; name: string; state: DeliveryState; message_id: string }>;
+  const rows = raw.map(row => { const evidence = readEvidence(db, row.message_id); return { userId: row.userId, name: row.name, state: evidenceState(evidence) || (row.state === "sent" ? "submitted" : row.state),
+    submissionState: row.state, legacySubmission: row.state === "sent", evidence } as SecretaryOutboxRecipientStatus; });
   const count = (states: string[]) => rows.filter(row => states.includes(row.state)).length;
-  const pendingCount = count(["queued", "sending"]), acceptedCount = count(["sent"]), failedCount = count(["failed"]), uncertainCount = count(["uncertain"]);
-  const state = batch.confirmed_at === null ? "preview" : pendingCount ? "queued" : uncertainCount ? "uncertain" : failedCount ? "failed" : "sent";
-  return { batchId: batch.id, state, recipientCount: frozenRecipients(batch).length, acceptedCount, failedCount, uncertainCount, pendingCount, recipients: rows };
+  const pendingCount = raw.filter(row => ["queued", "sending"].includes(row.state)).length;
+  const acceptedCount = count(["server_ack", "delivered", "read"]), deliveredCount = count(["delivered", "read"]), readCount = count(["read"]);
+  const submittedCount = count(["submitted"]), failedCount = count(["failed", "error"]), uncertainCount = count(["uncertain"]);
+  const state: BatchState = batch.confirmed_at === null ? "preview" : pendingCount ? "queued" : uncertainCount ? "uncertain" : failedCount ? "failed" : submittedCount ? "submitted"
+    : readCount === rows.length ? "read" : deliveredCount === rows.length ? "delivered" : "server_ack";
+  return { batchId: batch.id, state, recipientCount: frozenRecipients(batch).length, acceptedCount, submittedCount, deliveredCount, readCount, failedCount, uncertainCount, pendingCount, recipients: rows };
 }
 export function confirmSecretaryOutboxPreview(db: DatabaseSync, input: Identity & { batchId: string; confirmationMessageId: string },
   config: SecretaryOutboxConfig, options: { now?: number | (() => number) } = {}): SecretaryOutboxStatus {
@@ -163,6 +222,7 @@ export function confirmSecretaryOutboxPreview(db: DatabaseSync, input: Identity 
 export function getSecretaryOutboxStatus(db: DatabaseSync, input: Identity, config: SecretaryOutboxConfig): SecretaryOutboxStatus | null {
   owner(db, input, config);
   if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='secretary_outbox_batches'").get()) return null;
+  migrateSecretaryOutbox(db);
   return atomic(db, () => {
     const requester = owner(db, input, config);
     const batch = db.prepare("SELECT * FROM secretary_outbox_batches WHERE requester_id=? AND requester_phone=? AND confirmed_at IS NOT NULL ORDER BY confirmed_at DESC,rowid DESC LIMIT 1").get(requester.actor.id, requester.phone) as Batch | undefined;
@@ -175,6 +235,7 @@ export function createSecretaryOutboxJobs({ db, config, now = Date.now, timeoutM
   db: DatabaseSync; config: SecretaryOutboxConfig | (() => SecretaryOutboxConfig); now?: () => number; timeoutMs?: number;
 }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 15_000) throw new Error("Invalid outbox deadline.");
+  migrateSecretaryOutbox(db);
   let running = false;
   const current = () => typeof config === "function" ? config() : config;
   function claim(): Job | null {
@@ -198,7 +259,7 @@ export function createSecretaryOutboxJobs({ db, config, now = Date.now, timeoutM
       return { kind: "delivery", id: row.id, batch, recipient: { userId: row.recipient_id, name: row.recipient_name, phone: row.recipient_phone }, messageId: row.message_id };
     });
   }
-  function finish(job: Job, state: "sent" | "failed" | "uncertain", reason: string) {
+  function finish(job: Job, state: "submitted" | "failed" | "uncertain", reason: string) {
     if (job.kind === "receipt") db.prepare("UPDATE secretary_outbox_batches SET receipt_state=? WHERE id=? AND receipt_state='sending'").run(state, job.id);
     else db.prepare("UPDATE secretary_outbox_deliveries SET state=?,finished_at=?,outcome_code=? WHERE id=? AND state='sending'").run(state, timestamp(now), reason, job.id);
   }
@@ -208,14 +269,16 @@ export function createSecretaryOutboxJobs({ db, config, now = Date.now, timeoutM
     if (job.kind === "delivery" && timestamp(now) - job.batch.confirmed_at! >= MAX_QUEUE_MS) return null;
     if (job.kind === "delivery") return { to: `${job.recipient!.phone}@s.whatsapp.net`, text: job.batch.body };
     const summary = summarize(db, job.batch);
-    const labels: Record<DeliveryState, string> = { queued: "بانتظار الإرسال", sending: "قيد الإرسال", sent: "قُبل الإرسال", failed: "تعذّر الإرسال", uncertain: "النتيجة غير مؤكدة" };
     const outcomes = summary.recipients.map(recipient => {
       const name = recipient.name.replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/g, " ").slice(0, 60).trim() || "عضو الفريق";
-      return `• ${name}: ${labels[recipient.state]}`;
+      return `• ${name}: ${secretaryOutboxDeliveryLabel(recipient)}`;
     }).join("\n");
-    return { to: `${job.batch.requester_phone}@s.whatsapp.net`, text: `نتيجة إرسال رسالتك الخاصة إلى الفريق:\nقُبل الإرسال عبر واتساب: ${summary.acceptedCount} من ${summary.recipientCount}.\nتعذّر الإرسال: ${summary.failedCount}.\nالنتيجة غير مؤكدة: ${summary.uncertainCount}.\n\n${outcomes}\n\nقبول الإرسال لا يؤكد وصول الرسالة أو قراءتها. لن أعيد إرسال الحالات غير المؤكدة تلقائيًا.` };
+    return { to: `${job.batch.requester_phone}@s.whatsapp.net`, text: `نتيجة محاولة إرسال رسالتك الخاصة إلى الفريق:\nورد إقرار من خادم واتساب: ${summary.acceptedCount} من ${summary.recipientCount}.\nورد إيصال وصول: ${summary.deliveredCount}؛ وإيصال قراءة: ${summary.readCount}.\nسُلّمت للنقل بلا إيصال: ${summary.submittedCount}.\nتعذّر الإرسال: ${summary.failedCount}.\nالنتيجة غير مؤكدة: ${summary.uncertainCount}.\n\n${outcomes}\n\nنجاح محاولة النقل وحده لا يؤكد وصول الرسالة أو قراءتها. هذه أحدث الإيصالات المتاحة الآن؛ لن أعيد إرسال الحالات غير المؤكدة تلقائيًا.` };
   }
-  return { async deliverNext(send: (message: { to: string; text: string; messageId: string; signal: AbortSignal }) => Promise<unknown>) {
+  return {
+    getTransportBinding(messageId: string): SecretaryTransportBinding | null { const binding = transportBinding(db, messageId); return binding ? { messageId: binding.messageId, to: binding.to, kind: binding.kind } : null; },
+    recordTransportUpdate(update: SecretaryTransportUpdate) { return recordTransportUpdate(db, update, timestamp(now)); },
+    async deliverNext(send: (message: { to: string; text: string; messageId: string; signal: AbortSignal }) => Promise<unknown>) {
     if (running || db.isTransaction) return { status: "idle" as const };
     running = true;
     let job: Job | null = null;
@@ -229,8 +292,12 @@ export function createSecretaryOutboxJobs({ db, config, now = Date.now, timeoutM
         await Promise.race([send({ ...message, messageId: job.messageId, signal: controller.signal }), new Promise<never>((_, reject) => {
           timer = setTimeout(() => { controller.abort(); reject(new Error("uncertain")); }, timeoutMs);
         })]);
-        finish(job, "sent", "accepted"); return { status: "sent" as const };
-      } catch {
+        finish(job, "submitted", "transport_submitted"); return { status: "submitted" as const };
+      } catch (error) {
+        if (error && typeof error === "object" && "definitelyNotSent" in error && error.definitelyNotSent === true && "code" in error
+          && ["recipient_devices_unavailable", "transport_preflight_rejected"].includes(String(error.code))) {
+          finish(job, "failed", "transport_preflight_rejected"); return { status: "failed" as const };
+        }
         // Once the send callback was invoked, even a rejected promise may have reached WhatsApp.
         finish(job, "uncertain", "send_outcome_unknown"); return { status: "uncertain" as const };
       } finally { clearTimeout(timer); }

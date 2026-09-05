@@ -15,7 +15,7 @@ async function main() {
   }
   const config = loadConfig(process.env, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
   const { default: makeWASocket, BufferJSON, initAuthCreds, proto, jidNormalizedUser, makeCacheableSignalKeyStore, DisconnectReason, downloadContentFromMessage,
-    generateWAMessageContent, decryptPollVote, normalizeMessageContent } = await import('baileys');
+    generateWAMessageContent, generateWAMessage, decryptPollVote, normalizeMessageContent } = await import('baileys');
   const { default: pino } = await import('pino');
   const logger = pino({ level: 'silent' });
   process.umask(0o077);
@@ -64,7 +64,7 @@ async function main() {
   }
   const runtime = createBridgeRuntime({
     config, store, auth, makeWASocket, jidNormalizedUser, makeCacheableSignalKeyStore, DisconnectReason, logger, otpQueue,
-    control, isActiveNumber, secretaryJobs, secretaryOutbox, proto, generateWAMessageContent, decryptPollVote, normalizeMessageContent,
+    control, isActiveNumber, secretaryJobs, secretaryOutbox, proto, generateWAMessageContent, generateWAMessage, decryptPollVote, normalizeMessageContent,
     ...(config.voiceEnabled ? { transcribeVoice: createVoiceTranscriber({ apiKey: process.env.GROQ_API_KEY, downloadContent: downloadContentFromMessage }) } : {}),
     onStop: code => { process.exitCode = code === 'service_shutdown' ? 0 : 78; },
   });

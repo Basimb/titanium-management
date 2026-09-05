@@ -6,7 +6,7 @@ import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
 import { directTaskCreationIntent, emptySecretaryIntent, validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
 import { priorityTaskQuery, type PriorityTaskQuery } from "./secretary-priority-query.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
-import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, SecretaryOutboxError } from "./secretary-outbox.ts";
+import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, secretaryOutboxDeliveryLabel, SecretaryOutboxError } from "./secretary-outbox.ts";
 import { migrateSecretaryChoices, createSecretaryChoices, consumeSecretaryChoice, clearSecretaryChoices, secretaryChoiceOptions, SecretaryChoiceError, type SecretaryChoices, type SecretaryChoiceField } from "./secretary-choices.ts";
 
 type Task = { id: string; projectId: string; title: string; details: string; status: string; priority: string; owner: string | null; suggestedOwner: string | null; dueDate: string | null; updatedAt: number | null; archivedAt: number | null };
@@ -480,8 +480,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     if (plan.kind === "message_status") {
       try {
         const batch = getSecretaryOutboxStatus(db, { actor: freshActor, origin: { senderNumber: event.senderNumber, groupId: event.groupId } }, config);
-        const labels: Record<string,string> = { queued: "بانتظار الإرسال", sending: "جارٍ الإرسال", sent: "قُبل إرسالها عبر واتساب", failed: "لم تُرسل", uncertain: "النتيجة غير مؤكدة؛ لن نكررها تلقائيًا" };
-        return save(db, event, freshActor, { status: "summary", ...(batch ? { batchId: batch.batchId } : {}), reply: batch ? `نتيجة آخر رسالة مؤكدة للتيم:\n${batch.recipients.map(user => `• ${clean(user.name, 80)}: ${labels[user.state] || "غير معروف"}`).join("\n")}\nقبول واتساب لا يعني أن الموظف قرأ الرسالة.` : "ما في رسالة مؤكدة للتيم مسجّلة بعد." }, [], now);
+        return save(db, event, freshActor, { status: "summary", ...(batch ? { batchId: batch.batchId } : {}), reply: batch ? `نتيجة آخر طلب إرسال وافقت عليه للتيم:\n${batch.recipients.map(user => `• ${clean(user.name, 80)}: ${secretaryOutboxDeliveryLabel(user)}`).join("\n")}\nإقرار خادم واتساب: ${batch.acceptedCount}؛ وصول للجهاز: ${batch.deliveredCount}؛ قراءة: ${batch.readCount}. نجاح محاولة النقل وحده لا يثبت الوصول أو القراءة.` : "ما في طلب إرسال للتيم وافقت عليه ومسجّل بعد." }, [], now);
       } catch(error) { if (!(error instanceof SecretaryOutboxError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
     }
     if (plan.kind === "command" || plan.kind === "remind" || plan.kind === "message_team") db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);

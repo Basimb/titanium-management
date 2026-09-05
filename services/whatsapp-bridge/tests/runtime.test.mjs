@@ -16,6 +16,7 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false, otpQueue,
   isActiveNumber = number => number === member, control, secretaryJobs, secretaryOutbox } = {}) {
+  if (secretaryOutbox && typeof secretaryOutbox.recordTransportUpdate !== 'function') secretaryOutbox.recordTransportUpdate = () => ({ status: 'recorded' });
   const directory = mkdtempSync(path.join(os.tmpdir(), 'titanium-bridge-runtime-test-'));
   const store = openStore(directory);
   const logger = pino({ level: 'silent' });
@@ -39,12 +40,14 @@ function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false
     ...baileys, config, store, auth, logger, now: () => clock, timers, otpQueue, isActiveNumber, control, secretaryJobs, secretaryOutbox,
     makeWASocket(options) {
       // Never call the actual Baileys factory. Every network-capable method is mocked.
-      const socket = { options, ev: new EventEmitter(), authState: options.auth, pairCalls: [], endCalls: 0,
+      const socket = { options, ev: new EventEmitter(), ws: new EventEmitter(), authState: options.auth, pairCalls: [], endCalls: 0,
         get user() { return options.auth.creds.me; },
-        signalRepository: { lidMapping: { getPNForLID: async () => null } },
+        signalRepository: { lidMapping: { getPNForLID: async () => null, getLIDForPN: async () => null } },
         async requestPairingCode(number) { this.pairCalls.push(number); return 'TESTCODE'; },
         end() { this.endCalls += 1; },
         async groupMetadata() { throw new Error('Unexpected group request'); },
+        async getUSyncDevices(jids) { return jids.map(jid => ({ jid })); },
+        async relayMessage() { throw new Error('Unexpected outgoing relay'); },
         async sendMessage() { throw new Error('Unexpected outgoing message'); },
       };
       sockets.push(socket);
@@ -233,25 +236,36 @@ test('private outbox sends exact approved text only on the verified linked accou
     calls++;
     await send({ to: `${member}@s.whatsapp.net`, text, messageId: 'TITANIUMOUT_SYNTHETIC', signal: new AbortController().signal });
     await send({ to: `${owner}@s.whatsapp.net`, text: 'SYNTHETIC_PRIVATE_RECEIPT', messageId: 'TITANIUMOUTSUMMARY_SYNTHETIC', signal: new AbortController().signal });
-    return { status: 'sent' };
+    return { status: 'submitted' };
   } } });
   h.config.allowedNumbers.add(owner);
   await h.runtime.start();
   const socket = h.sockets[0];
   const sent = [];
-  socket.sendMessage = async (...args) => sent.push(args);
+  socket.relayMessage = async (jid, message, options) => {
+    sent.push([jid, message, options]);
+    socket.ws.emit('CB:ack,class:message', { tag: 'ack', attrs: { class: 'message', from: jid, id: options.messageId } });
+  };
   h.intervals[0].fn(); await flush();
   assert.equal(calls, 0);
   socket.ev.emit('connection.update', { connection: 'open' }); await flush();
   h.intervals[0].fn(); await flush(); await flush();
   assert.equal(calls, 1);
-  assert.deepEqual(sent[0], [`${member}@s.whatsapp.net`, { text, linkPreview: null }, { messageId: 'TITANIUMOUT_SYNTHETIC' }]);
+  assert.equal(sent[0][0], `${member}@s.whatsapp.net`);
+  assert.equal(sent[0][1].extendedTextMessage.text, text);
+  assert.equal(sent[0][1].extendedTextMessage.jpegThumbnail ?? null, null);
+  assert.deepEqual(sent[0][2], { messageId: 'TITANIUMOUT_SYNTHETIC' });
+  const persisted = h.store.db.prepare('SELECT message_proto,server_ack_at FROM private_outbox_transport WHERE message_id=?').get('TITANIUMOUT_SYNTHETIC');
+  assert.equal(persisted.server_ack_at, clock);
+  assert.deepEqual(Buffer.from(persisted.message_proto), Buffer.from(baileys.proto.Message.encode(sent[0][1]).finish()));
+  const retry = await socket.options.getMessage({ id: 'TITANIUMOUT_SYNTHETIC', remoteJid: `${member}@s.whatsapp.net`, fromMe: true });
+  assert.equal(retry.extendedTextMessage.text, text);
   assert.equal(sent[1][0], `${owner}@s.whatsapp.net`);
   assert.deepEqual(socket.pairCalls, []);
   assert.deepEqual(h.stopped, []);
   assert.ok(h.auth.state.creds.registered);
   assert.doesNotMatch(h.output.join('\n'), /1555|SYNTHETIC|نص تجريبي/);
-  assert.match(h.output.join('\n'), /Titanium secretary outbox: sent/);
+  assert.match(h.output.join('\n'), /Titanium secretary outbox: submitted/);
 });
 
 test('private outbox rejects every group, noncanonical recipient, revoked user, altered text and invalid send identifier', async t => {
@@ -311,9 +325,10 @@ test('aborted ambiguous outbox delivery does not hang or tear down subsequent OT
   const socket = h.sockets[0];
   socket.ev.emit('connection.update', { connection: 'open' }); await flush();
   const sent = [];
-  socket.sendMessage = async (...args) => {
-    if (args[1].text === 'SYNTHETIC_HUNG_SEND') { controller.abort(); return new Promise(() => {}); }
-    sent.push(args);
+  socket.sendMessage = async (...args) => sent.push(args);
+  socket.relayMessage = async (_jid, content) => {
+    assert.equal(content.extendedTextMessage.text, 'SYNTHETIC_HUNG_SEND');
+    controller.abort(); return new Promise(() => {});
   };
   h.intervals[0].fn(); await flush(); await flush();
   assert.match(h.output.join('\n'), /outbox: uncertain/);
@@ -328,10 +343,10 @@ test('aborted ambiguous outbox delivery does not hang or tear down subsequent OT
 test('OTP stays first while inbox replies, outbox and reminders take fair turns under sustained backlogs', async t => {
   let otpPending = true;
   const order = [];
-  const job = text => ({ async deliverNext(send) {
-    await send({ to: `${member}@s.whatsapp.net`, text, messageId: `SYNTHETIC_${text}`, signal: new AbortController().signal });
-    return { status: 'sent' };
-  } });
+  const job = text => { let sequence = 0; return { async deliverNext(send) {
+    await send({ to: `${member}@s.whatsapp.net`, text, messageId: `SYNTHETIC_${text}_${++sequence}`, signal: new AbortController().signal });
+    return { status: text === 'OUTBOX' ? 'submitted' : 'sent' };
+  } }; };
   const h = harness(t, { otpQueue: { async deliverNext() {
     if (!otpPending) return { status: 'idle' };
     otpPending = false; order.push('OTP'); return { status: 'sent' };
@@ -340,6 +355,10 @@ test('OTP stays first while inbox replies, outbox and reminders take fair turns 
   const socket = h.sockets[0];
   socket.ev.emit('connection.update', { connection: 'open' }); await flush();
   socket.sendMessage = async (_jid, content) => order.push(content.text);
+  socket.relayMessage = async (jid, message, options) => {
+    assert.equal(message.extendedTextMessage.text, 'OUTBOX'); order.push('OUTBOX');
+    socket.ws.emit('CB:ack,class:message', { tag: 'ack', attrs: { class: 'message', from: jid, id: options.messageId } });
+  };
   for (let index = 0; index < 6; index++) {
     const messageId = `INBOX_${index}`;
     h.store.enqueue({ chatJid: `${member}@s.whatsapp.net`, body: { messageId, senderNumber: member, groupId: null, text: 'مرحبا', receivedAt: clock } });
