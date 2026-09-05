@@ -6,12 +6,13 @@ import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
 import { validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
 import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, SecretaryOutboxError } from "./secretary-outbox.ts";
+import { migrateSecretaryChoices, createSecretaryChoices, consumeSecretaryChoice, clearSecretaryChoices, secretaryChoiceOptions, SecretaryChoiceError, type SecretaryChoices, type SecretaryChoiceField } from "./secretary-choices.ts";
 
 type Task = { id: string; projectId: string; title: string; details: string; status: string; priority: string; owner: string | null; suggestedOwner: string | null; dueDate: string | null; updatedAt: number | null; archivedAt: number | null };
 type Project = { id: string; name: string; status: string; updatedAt?: number | null; archivedAt?: number | null };
 type Snapshot = { tasks: Task[]; projects: Project[]; users: Array<ChatUser>; comments: Array<{ taskId: string; author: string; body: string; createdAt: number }> };
 type Event = TeamChatEnvelope & { replyToMessageId?: string | null; responseMessageId?: string | null };
-type Result = { status: string; reply: string; taskId?: string; batchId?: string };
+type Result = { status: string; reply: string; taskId?: string; batchId?: string; choices?: SecretaryChoices };
 type Pending = { token: string; command_json: string; snapshot_hash: string; original_text: string; source_message_id: string; expires_at: number };
 type HistoryRow = { original_text: string; result_json: string; scope_json: string };
 type TaskDraft = { projectId: string | null; title: string | null; details: string | null; priority: "red" | "yellow" | "green" | null; ownerId: string | null; dueDate: string | null };
@@ -28,11 +29,12 @@ const clean = (value: unknown, max = 200) => String(value ?? "").replace(/[\x00-
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const conversation = (event: Event, actor: ChatUser) => hash([normalizeContactNumber(event.senderNumber), event.groupId, actor.id]);
 const eventKey = (event: Event) => hash([event.senderNumber, event.groupId, event.messageId]);
-const eventHash = (event: Event) => hash([event.senderNumber, event.groupId, event.text, event.replyToMessageId ?? null, event.responseMessageId ?? null, event.inputKind || "text"]);
+const eventHash = (event: Event) => hash([event.senderNumber, event.groupId, event.text, event.replyToMessageId ?? null, event.responseMessageId ?? null, event.inputKind || "text", ...(event.choice ? [event.choice] : [])]);
 function transaction<T>(db: DatabaseSync, work: () => T): T { db.exec("BEGIN IMMEDIATE"); try { const result = work(); db.exec("COMMIT"); return result; } catch (error) { db.exec("ROLLBACK"); throw error; } }
 export function migrateSecretary(db: DatabaseSync) {
   migrateManagementActions(db);
   migrateSecretaryOutbox(db);
+  migrateSecretaryChoices(db);
   db.exec(`CREATE TABLE IF NOT EXISTS secretary_events (event_key TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,actor_id TEXT NOT NULL,conversation_key TEXT NOT NULL,original_text TEXT NOT NULL,result_json TEXT NOT NULL,scope_json TEXT NOT NULL,created_at INTEGER NOT NULL,response_message_id TEXT);
     CREATE INDEX IF NOT EXISTS secretary_history ON secretary_events(conversation_key,created_at);
     CREATE TABLE IF NOT EXISTS secretary_pending (conversation_key TEXT PRIMARY KEY,token TEXT NOT NULL,command_json TEXT NOT NULL,snapshot_hash TEXT NOT NULL,original_text TEXT NOT NULL,source_message_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
@@ -71,7 +73,9 @@ function lookup(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot
   const row = db.prepare("SELECT payload_hash,actor_id,result_json,scope_json FROM secretary_events WHERE event_key=?").get(eventKey(event)) as { payload_hash: string; actor_id: string; result_json: string; scope_json: string } | undefined;
   if (!row) return null;
   if (row.payload_hash !== eventHash(event) || row.actor_id !== actor.id || !scopeAllowed(JSON.parse(row.scope_json), state)) return { status: "denied", reply: "" };
-  return { ...JSON.parse(row.result_json), status: "duplicate" };
+  const result = JSON.parse(row.result_json);
+  if (result.choices && (actor.id !== "basem" || actor.role !== "admin" || actor.active !== 1 || event.groupId !== null)) return { status: "denied", reply: "" };
+  return { ...result, status: "duplicate" };
 }
 function save(db: DatabaseSync, event: Event, actor: ChatUser, result: Result, scope: string[], now: number) {
   const bounded = { ...result, reply: result.reply.slice(0, 3800) };
@@ -174,11 +178,31 @@ function intakeQuestion(draft: TaskDraft, state: Snapshot): string | null {
   if (!draft.dueDate) return "شو موعدها؟ اذكر التاريخ، أو قل «بدون موعد».";
   return null;
 }
+function choiceCatalogHash(state: Snapshot) {
+  return hash({ projects: state.projects.map(project => ({ id: project.id, name: project.name, status: project.status, updatedAt: project.updatedAt, archivedAt: project.archivedAt })),
+    users: state.users.map(user => ({ id: user.id, name: user.name, active: user.active, role: user.role })) });
+}
+function missingChoiceField(draft: TaskDraft): SecretaryChoiceField | null {
+  if (!draft.projectId) return "projectId";
+  if (!draft.title) return null;
+  if (!draft.ownerId) return "ownerId";
+  if (!draft.priority) return "priority";
+  return draft.dueDate ? null : "dueDate";
+}
+function intakeChoices(db: DatabaseSync, actor: ChatUser, state: Snapshot, draft: TaskDraft, key: string, now: number): SecretaryChoices | undefined {
+  const field = missingChoiceField(draft); if (!field) return undefined;
+  const options = secretaryChoiceOptions(field, { projects: state.projects.filter(project => project.status === "active" && !project.archivedAt), users: state.users.filter(user => user.active === 1), now });
+  if (!options.length) return undefined;
+  const titles = { projectId: "اختار المشروع", ownerId: "مين المسؤول عن المهمة؟", priority: "اختار الأولوية، وليس حالة التنفيذ", dueDate: "اختار موعد المهمة بتوقيت عمّان" };
+  return createSecretaryChoices(db, { conversationKey: key, actorId: actor.id, draftVersion: hash(intakeRow(db, key)), catalogHash: choiceCatalogHash(state),
+    field, title: titles[field], options, now, expiresAt: now + INTAKE_MS });
+}
 function taskIntake(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot, plan: SecretaryIntent,
-  key: string, existingDraft: TaskDraft | null, now: number): Result {
+  key: string, existingDraft: TaskDraft | null, now: number, freeTextField?: SecretaryChoiceField): Result {
   if (actor.id !== "basem" || actor.role !== "admin") return save(db, event, actor, { status: "denied", reply: "إنشاء المهام وتعيينها من صلاحيات باسم فقط. أقدر أساعدك بتحديث مهامك الحالية." }, [], now);
   if (plan.intakeMode !== "start" && (plan.intakeMode !== "continue" || !existingDraft)) {
     db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
+    clearSecretaryChoices(db, key);
     return save(db, event, actor, { status: "clarify", reply: "ما في مسودة مهمة حالية نكمل عليها. احكيلي المهمة الجديدة المطلوبة من البداية." }, [], now);
   }
   const proposed: TaskDraft = { projectId: plan.projectId, title: plan.fields.title, details: plan.fields.details,
@@ -189,13 +213,18 @@ function taskIntake(db: DatabaseSync, event: Event, actor: ChatUser, state: Snap
     }
   }
   const draft = availableDraft(proposed, state);
+  clearSecretaryChoices(db, key);
   // Collecting a new proposal never reuses an older task/send confirmation.
   db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
   db.prepare("INSERT INTO secretary_task_intake VALUES(?,?,?,?) ON CONFLICT(conversation_key) DO UPDATE SET draft_json=excluded.draft_json,last_event_key=excluded.last_event_key,expires_at=excluded.expires_at")
     .run(key, JSON.stringify(draft), eventKey(event), now + INTAKE_MS);
   const question = intakeQuestion(draft, state);
   const scope = draft.projectId ? ["p:" + draft.projectId] : [];
-  if (question) return save(db, event, actor, { status: "clarify", reply: question }, scope, now);
+  if (question) {
+    if (freeTextField) return save(db, event, actor, { status: "clarify", reply: freeTextField === "dueDate" ? "اكتب التاريخ المطلوب باليوم والشهر والسنة." : freeTextField === "projectId" ? "اكتب اسم المشروع المقصود." : "اكتب اسم الموظف المقصود." }, scope, now);
+    const choices = event.groupId === null ? intakeChoices(db, actor, state, draft, key, now) : undefined;
+    return save(db, event, actor, { status: "clarify", reply: question + (choices ? `\n\n${choices.options.map(option => option.label).join("\n")}\nاختار خيارًا واحدًا، أو اكتب اسم الخيار بالكلام.` : ""), ...(choices ? { choices } : {}) }, scope, now);
+  }
   const project = state.projects.find(item => item.id === draft.projectId)!;
   const owner = state.users.find(item => item.id === draft.ownerId);
   const token = "T" + randomBytes(3).toString("hex").toUpperCase();
@@ -232,6 +261,27 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const pendingDraft = pendingTaskDraft(pending, initialHash, now);
   const draftCandidate = storedIntake && storedIntake.expires_at > now ? JSON.parse(storedIntake.draft_json) : pendingDraft;
   const taskDraft = draftCandidate && actor.id === "basem" && actor.role === "admin" ? availableDraft(draftCandidate, initial) : null;
+  const eventChoice = event.choice;
+  if (eventChoice) return transaction(db, () => {
+    const freshActor = actorFor(db, event, config);
+    if (!config.enabled || !freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor) || freshActor.id !== "basem" || freshActor.role !== "admin"
+      || event.groupId !== null || event.inputKind === "voice" || event.replyToMessageId) return { status: "denied", reply: "" };
+    const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
+    try {
+      const liveIntake = intakeRow(db, key);
+      if (!taskDraft || !storedIntake || !liveIntake || liveIntake.expires_at <= now || hash(liveIntake) !== hash(storedIntake)) throw new SecretaryChoiceError();
+      const selected = consumeSecretaryChoice(db, { conversationKey: key, actorId: freshActor.id, draftVersion: hash(liveIntake), catalogHash: choiceCatalogHash(state), now }, eventChoice);
+      const current = availableDraft(JSON.parse(liveIntake.draft_json), state);
+      // Only the stored opaque option selects a value; the submitted display label is not an instruction.
+      const draft = { ...current, ...(selected.value === null ? {} : { [selected.field]: selected.value }) } as TaskDraft;
+      const plan: SecretaryIntent = { kind: "task_draft", intakeMode: "continue", action: null, taskId: null, projectId: draft.projectId, recipientIds: [], message: null,
+        fields: { title: draft.title, details: draft.details, ownerId: draft.ownerId, priority: draft.priority, dueDate: draft.dueDate, name: null, reason: null, body: null, remindAt: null } };
+      return taskIntake(db, event, freshActor, state, plan, key, current, now, selected.value === null ? selected.field : undefined);
+    } catch (error) {
+      if (!(error instanceof SecretaryChoiceError)) throw error;
+      return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now);
+    }
+  });
   const quote = event.replyToMessageId ? db.prepare("SELECT event_key,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND response_message_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(key, event.replyToMessageId) as { event_key: string; result_json: string; scope_json: string } | undefined : undefined;
   if (event.replyToMessageId && (!quote || !scopeAllowed(JSON.parse(quote.scope_json), initial))) return transaction(db, () => save(db, event, actor, { status: "clarify", reply: "ما قدرت أربط هذا الرد بطلب متاح إلك. اذكر المهمة والتغيير المطلوب بدل الرد على رسالة قديمة أو لشخص آخر." }, [], now));
   const historyRows = conversationHistory(db, key, initial, now);
@@ -243,6 +293,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     const duplicate = lookup(db, event, freshActor, stateFor(db, freshActor)); if (duplicate) return duplicate;
     db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
     db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    clearSecretaryChoices(db, key);
     return save(db, event, freshActor, { status: "cancelled", reply: "ألغيت مسودة المهمة. لم أنشئ مهمة أو أنفّذ طلبًا سابقًا." }, [], now);
   });
   if (!pending && isConfirmationAttempt(event.text)) return transaction(db, () => {
@@ -264,6 +315,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
       if (quote && !matchingQuote) return save(db, event, freshActor, { status: "clarify", reply: "هذا الرد ليس على الطلب المعلّق الحالي. أكّد باستخدام رمز الطلب المعروض أمامك." }, [], now);
       if (!isCancellation(event.text) && !isAffirmation(event.text, live.token, matchingQuote)) return save(db, event, freshActor, { status: "clarify", reply: `حتى ما أنفّذ طلبًا غير المقصود، اكتب «موافق ${live.token}» أو رد مباشرةً بالموافقة على رسالة هذا الطلب. لم أنفّذ أي تغيير.` }, [], now);
       db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+      clearSecretaryChoices(db, key);
       if (isCancellation(event.text)) { log(db, freshActor, event, "secretary_cancel", { summary: "ألغى الطلب قبل التنفيذ" }, now); return save(db, event, freshActor, { status: "cancelled", reply: "ألغيت الطلب المعلّق، ما غيّرت المهمة أو المشروع." }, [], now); }
       if (live.expires_at <= now || live.snapshot_hash !== fingerprint(state)) return save(db, event, freshActor, { status: "stale", reply: "انتهى وقت التأكيد أو تغيّرت البيانات/الصلاحيات. ما نفذت الطلب؛ اذكره من جديد لأعرض الوضع الحالي." }, [], now);
       const command = JSON.parse(live.command_json);
@@ -306,6 +358,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     // Only an explicit task_draft plan may continue intake; unrelated subjects cannot revive it later.
     if (storedIntake) db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
     if (pendingDraft) db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    clearSecretaryChoices(db, key);
     if (plan.kind === "message_status") {
       try {
         const batch = getSecretaryOutboxStatus(db, { actor: freshActor, origin: { senderNumber: event.senderNumber, groupId: event.groupId } }, config);

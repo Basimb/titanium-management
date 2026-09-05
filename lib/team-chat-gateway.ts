@@ -80,12 +80,13 @@ export type TeamChatEnvelope = {
   replyToMessageId?: string | null;
   responseMessageId?: string | null;
   inputKind?: "text" | "voice";
+  choice?: { questionId: string; optionId: string };
 };
 
 function envelope(value: unknown): TeamChatEnvelope | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
-  if (Object.keys(v).some(key => !["groupId", "messageId", "receivedAt", "senderNumber", "text", "replyToMessageId", "responseMessageId", "inputKind"].includes(key))
+  if (Object.keys(v).some(key => !["groupId", "messageId", "receivedAt", "senderNumber", "text", "replyToMessageId", "responseMessageId", "inputKind", "choice"].includes(key))
     || (v.inputKind !== undefined && v.inputKind !== "text" && v.inputKind !== "voice")
     || ["replyToMessageId", "responseMessageId"].some(key => v[key] != null && (typeof v[key] !== "string" || !/^[A-Za-z0-9._:@-]{1,160}$/.test(v[key] as string)))
     || typeof v.messageId !== "string" || !/^[A-Za-z0-9._:@-]{1,160}$/.test(v.messageId)
@@ -93,6 +94,15 @@ function envelope(value: unknown): TeamChatEnvelope | null {
     || !(v.groupId === null || (typeof v.groupId === "string" && /^\d+(?:-\d+)?@g\.us$/.test(v.groupId)))
     || typeof v.text !== "string" || !v.text.trim() || v.text.length > 2000
     || !Number.isSafeInteger(v.receivedAt) || Number(v.receivedAt) <= 0) return null;
+  if (v.choice !== undefined) {
+    // Choice IDs are authenticated transport data, not free text for an LLM.
+    // Only the secretary can resolve them against its current actor-bound question.
+    if (!v.choice || typeof v.choice !== "object" || Array.isArray(v.choice)
+      || v.groupId !== null || v.inputKind === "voice" || v.replyToMessageId != null) return null;
+    const choice = v.choice as Record<string, unknown>;
+    if (Object.keys(choice).length !== 2 || Object.keys(choice).some(key => !["questionId", "optionId"].includes(key))
+      || [choice.questionId, choice.optionId].some(id => typeof id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(id))) return null;
+  }
   return v as TeamChatEnvelope;
 }
 
@@ -125,6 +135,7 @@ export async function handleTeamChatRequest(request: Request, dependencies: {
   let event: TeamChatEnvelope | null;
   try { event = envelope(JSON.parse(rawBody)); } catch { event = null; }
   if (!event) return response({ error: "Invalid message." }, 400);
+  if (event.choice && !dependencies.secretary) return response({ error: "Interactive choices are unavailable." }, 400);
   const origin = { senderNumber: event.senderNumber, groupId: event.groupId };
   try {
     const sqlite = dependencies.getDatabase();

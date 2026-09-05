@@ -1,5 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { boundedPlainText } from './group-privacy.mjs';
+import { normalizePollChoices } from './polls.mjs';
 
 export function signatureHeaders(rawBody, key, now) {
   const timestamp = String(now);
@@ -10,7 +11,7 @@ export function signatureHeaders(rawBody, key, now) {
   };
 }
 
-async function boundedResponse(response) {
+async function boundedResponse(response, now) {
   if (Number(response.headers.get('content-length')) > 16_384) throw new Error('response_too_large');
   if (!response.body) throw new Error('empty_response');
   const reader = response.body.getReader();
@@ -31,8 +32,10 @@ async function boundedResponse(response) {
       (result.taskId != null && (typeof result.taskId !== 'string' || result.taskId.length > 200))) {
     throw new Error('invalid_response');
   }
-  // Deliberately discard all extra response fields, especially any recipient.
-  return { status: result.status, reply: boundedPlainText(result.reply), ...(result.taskId ? { taskId: result.taskId } : {}) };
+  // Keep only bounded display choices; any model-provided recipient is discarded.
+  const choices = normalizePollChoices(result.choices, now);
+  return { status: result.status, reply: boundedPlainText(result.reply), ...(result.taskId ? { taskId: result.taskId } : {}),
+    ...(choices && result.reply ? { choices } : {}) };
 }
 
 export async function deliverOne(store, row, config, { fetcher = fetch, sendReply, now = Date.now,
@@ -78,7 +81,7 @@ export async function deliverOne(store, row, config, { fetcher = fetch, sendRepl
       store.fail(row.id, `backend_http_${response.status}`);
       return;
     }
-    try { store.backendResult(row.id, await boundedResponse(response)); }
+    try { store.backendResult(row.id, await boundedResponse(response, now())); }
     catch { store.fail(row.id, 'backend_invalid_result'); }
     return;
   }
@@ -87,7 +90,7 @@ export async function deliverOne(store, row, config, { fetcher = fetch, sendRepl
     store.attemptReply(row.id);
     try {
       // original chat and a persisted outgoing ID; never route from response text.
-      await sendReply(row.chat_jid, boundedPlainText(row.reply), row.reply_id, body);
+      await sendReply(row.chat_jid, boundedPlainText(row.reply), row.reply_id, body, JSON.parse(row.result || '{}'));
       store.done(row.id);
     } catch {
       if (row.reply_attempts + 1 >= 3) store.fail(row.id, 'reply_retry_exhausted');

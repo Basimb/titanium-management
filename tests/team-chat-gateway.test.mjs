@@ -66,6 +66,30 @@ test("unknown content type and methods cannot create writes", async () => {
   assert.equal(get.status, 405);
 });
 
+test("signed choices reject malformed, mixed-media, quoted and group payloads before DB access", async () => {
+  const choice = { questionId: "Q_fixture", optionId: "O_fixture" };
+  const secretary = async () => { throw Error("must not call secretary"); };
+  for (const override of [
+    { choice: null }, { choice: [] }, { choice: "bad" }, { choice: {} },
+    { choice: { ...choice, actorId: "basem" } }, { choice: { questionId: "Q_fixture" } },
+    { choice: { ...choice, optionId: "x".repeat(101) } }, { choice: { ...choice, optionId: "../x" } },
+    { choice: { ...choice, questionId: 123 } }, { choice, inputKind: "voice" },
+    { choice, replyToMessageId: "old-preview" }, { choice, groupId: "120363555000@g.us" },
+  ]) {
+    const result = await handleTeamChatRequest(request({ ...base, ...override }), {
+      config: configuration, getDatabase: mustNotOpen, now: () => now, secretary,
+    });
+    assert.equal(result.status, 400);
+  }
+});
+
+test("signed choice cannot fall through to the legacy language parser", async () => {
+  const result = await handleTeamChatRequest(request({ ...base, choice: { questionId: "Q_fixture", optionId: "O_fixture" } }), {
+    config: configuration, getDatabase: mustNotOpen, infer: mustNotOpen, now: () => now,
+  });
+  assert.equal(result.status, 400);
+});
+
 // Real in-memory integration of transport validation, scoped inference and the
 // synchronous transaction store. No production files, providers or users.
 let integrationSequence = 0;
@@ -103,6 +127,28 @@ function gatewayFixture(t) {
   const counts = () => ["comments", "audit_logs", "team_chat_events"].map(table => sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n);
   return { sqlite, clock, makeRequest, run, counts };
 }
+
+test("authenticated private choice reaches only the secretary with exact IDs and forwards options", async t => {
+  const f = gatewayFixture(t);
+  const choice = { questionId: "Q_fixture", optionId: "O_fixture" };
+  const choices = { id: "Q_next", title: "شو أولويتها؟", options: [{ id: "O_red", label: "عالية" }, { id: "O_green", label: "منخفضة" }], expiresAt: f.clock + 60000 };
+  let calls = 0;
+  const result = await f.run({ text: "اختيار تجريبي", choice, inputKind: "text" }, mustNotOpen, {
+    secretary: async (sqlite, event) => {
+      calls++;
+      assert.equal(sqlite, f.sqlite);
+      assert.deepEqual(event.choice, choice);
+      assert.equal(event.senderNumber, configuration.contacts[0].number);
+      return { status: "clarify", reply: "شو أولويتها؟", choices };
+    },
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual((await result.json()).choices, choices);
+  assert.equal(calls, 1);
+  f.sqlite.exec("UPDATE users SET active=0 WHERE id='tester'");
+  const denied = await f.run({ messageId: "choice-2", choice }, mustNotOpen, { secretary: mustNotOpen });
+  assert.equal(denied.status, 403);
+});
 
 test("integration: claim and update authenticate sender and use only scoped model fields", async t => {
   const f = gatewayFixture(t);

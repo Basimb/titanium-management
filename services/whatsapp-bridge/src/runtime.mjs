@@ -3,6 +3,7 @@ import { deliverOne } from './delivery.mjs';
 import { inspectGroupMembership, boundedPlainText, groupJid, withAbortSignal } from './group-privacy.mjs';
 import { processControlJob } from './control.mjs';
 import { selectVoiceIncoming } from './voice.mjs';
+import { createPollChoices } from './polls.mjs';
 
 function withDeadline(work) {
   let timer;
@@ -16,7 +17,8 @@ function withDeadline(work) {
 export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNormalizedUser,
   makeCacheableSignalKeyStore, DisconnectReason, logger, onStop = () => {}, output = console,
   now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch, otpQueue,
-  control, isActiveNumber = () => false, secretaryJobs, secretaryOutbox, transcribeVoice }) {
+  control, isActiveNumber = () => false, secretaryJobs, secretaryOutbox, transcribeVoice,
+  proto, generateWAMessageContent, decryptPollVote, normalizeMessageContent }) {
   let socket;
   let ready = false;
   let stopped = false;
@@ -31,6 +33,8 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   let preferOutbox = true;
   const groupCache = new Map();
   const groupEpoch = new Map();
+  const polls = proto && generateWAMessageContent && decryptPollVote
+    ? createPollChoices({ store, config, proto, generateWAMessageContent, decryptPollVote, normalizeMessageContent, now }) : null;
 
   function invalidateGroup(jid) {
     if (!config.allowedGroups.has(jid) && !groupEpoch.has(jid)) return;
@@ -97,7 +101,7 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       auth: { creds: auth.state.creds, keys: makeCacheableSignalKeyStore(auth.state.keys, logger) },
       logger, markOnlineOnConnect: false, syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
-      getMessage: async key => store.outgoingMessage(key),
+      getMessage: async key => polls?.outgoingMessage(key) || store.outgoingMessage(key),
       cachedGroupMetadata: async jid => {
         const cached = groupCache.get(jid);
         return cached && cached.expires > now() ? cached.metadata : undefined;
@@ -165,6 +169,12 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       incomingChain = incomingChain.then(async () => {
         for (const message of event.messages) {
           if (!ready || stopped || current !== socket) break;
+          if (polls?.isPollVote(message)) {
+            await polls.acceptVote(message, event, { identity, activatedAt,
+              authorize: async sender => ready && !stopped && current === socket && config.tasksEnabled !== false
+                && await isActiveNumber(sender) && ready && !stopped && current === socket });
+            continue;
+          }
           let incoming = await selectIncoming(message, event, config, identity, now(), activatedAt);
           if (!incoming && transcribeVoice && config.voiceEnabled && message.message?.audioMessage) {
             try {
@@ -238,14 +248,32 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       authorizeChat: async body => await isActiveNumber(body.senderNumber) &&
         (body.groupId === null || (await inspectGroup(body.groupId)).allowed),
       onPrivacyBlocked: privacyRefusal,
-      sendReply: async (jid, text, messageId, body) => {
+      sendReply: async (jid, text, messageId, body, result) => {
         if (!ready || stopped) throw new Error('not_connected');
         if (!await isActiveNumber(body.senderNumber)) throw new Error('sender_disabled');
         if (config.allowedGroups.has(jid)) {
           await sendGroup(jid, text, messageId);
           return;
         }
-        await socket.sendMessage(jid, { text, linkPreview: null }, { messageId });
+        const current = socket;
+        await current.sendMessage(jid, { text, linkPreview: null }, { messageId });
+        if (polls && body.groupId === null && result?.choices) {
+          // The text is the durable fallback. A poll failure must not retry this
+          // successful text or interrupt login/inbox processing.
+          try {
+            const pollResult = await polls.sendQuestion({ choices: result.choices, chatJid: jid, senderNumber: body.senderNumber }, {
+              identity: { normalizeJid: jidNormalizedUser, lookupPhoneForLid: value => current.signalRepository.lidMapping.getPNForLID(value) },
+              creatorJids: [current.user?.id || auth.state.creds.me?.id, auth.state.creds.me?.lid].filter(Boolean),
+              authorize: async sender => ready && !stopped && current === socket && config.tasksEnabled !== false
+                && await isActiveNumber(sender) && ready && !stopped && current === socket,
+              relay: (to, content, options, signal) => {
+                if (signal.aborted || !ready || stopped || current !== socket) throw new Error('poll_unavailable');
+                return current.relayMessage(to, content, options);
+              },
+            });
+            if (pollResult.status === 'uncertain') output.info('Titanium choices: uncertain; text fallback retained.');
+          } catch { output.info('Titanium choices: unavailable; text fallback retained.'); }
+        }
       },
     });
     return true;
