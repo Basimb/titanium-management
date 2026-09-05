@@ -1,0 +1,16 @@
+{
+  "name": "titanium-whatsapp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Disabled-by-default, independently paired WhatsApp task bridge draft",
+  "engines": { "node": ">=22.23.2" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "baileys": "7.0.0-rc14",
+    "pino": "9.6.0"
+  }
+}

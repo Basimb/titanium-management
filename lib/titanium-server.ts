@@ -56,6 +56,18 @@ class LocalDatabase {
 const dataDirectory = process.env.TITANIUM_DATA_DIR || path.join(process.cwd(), "data");
 const uploadDirectory = path.join(dataDirectory, "uploads");
 let localDatabase: LocalDatabase | null = null;
+let localChatDatabase: DatabaseSync | null = null;
+
+// Dedicated synchronous connection: a chat transaction must never join an
+// existing asynchronous UI batch while it is suspended between statements.
+export function chatDatabase() {
+  db(); // Initialize the same application's schema and data directory first.
+  if (!localChatDatabase) {
+    localChatDatabase = new DatabaseSync(path.join(dataDirectory, "titanium.sqlite"));
+    localChatDatabase.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+  }
+  return localChatDatabase;
+}
 
 export function db() {
   if (!localDatabase) {
