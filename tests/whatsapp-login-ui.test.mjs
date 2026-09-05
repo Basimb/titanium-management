@@ -119,3 +119,12 @@ test("dashboard uses server-selected auth method and gates every PIN section in 
   assert.match(source, /if \(next\.sessionToken\) sessionTokenRef\.current = next\.sessionToken/);
   assert.doesNotMatch(source, /localStorage|sessionStorage/);
 });
+
+test("auth and private state GETs use fresh per-request nonce with no-store and credentials", async () => {
+  const source = await read("../app/dashboard.tsx");
+  for (const endpoint of ["auth", "state"]) {
+    const request = 'fetch(`/api/' + endpoint + '?v=${crypto.randomUUID()}`, { cache:"no-store", credentials:"include", headers:sessionHeaders() })';
+    assert.ok(source.includes(request), `${endpoint} must generate a fresh nonce for each request`);
+  }
+  assert.doesNotMatch(source, /\/api\/(?:auth|state)\?v=\d/);
+});

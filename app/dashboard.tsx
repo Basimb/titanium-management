@@ -82,7 +82,7 @@ export default function Dashboard() {
 
   async function refreshAuth() {
     try {
-      const response = await fetch("/api/auth?v=20260902", { cache:"no-store", credentials:"include", headers:sessionHeaders() });
+      const response = await fetch(`/api/auth?v=${crypto.randomUUID()}`, { cache:"no-store", credentials:"include", headers:sessionHeaders() });
       const auth = await response.json();
       if (!response.ok) throw new Error(auth.error || "تعذر فحص الدخول");
       const whatsapp = auth.authMethod === "whatsapp";
@@ -100,7 +100,7 @@ export default function Dashboard() {
   }
 
   async function loadState() {
-    const response = await fetch("/api/state?v=20260902", { cache:"no-store", credentials:"include", headers:sessionHeaders() });
+    const response = await fetch(`/api/state?v=${crypto.randomUUID()}`, { cache:"no-store", credentials:"include", headers:sessionHeaders() });
     const next = await response.json();
     if (!response.ok) {
       if (response.status === 401) { setData(emptyState); return; }
