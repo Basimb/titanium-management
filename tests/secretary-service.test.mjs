@@ -226,7 +226,7 @@ test('late bare approval and old token/quote cannot execute a replacement reques
  const noInference=async()=>{throw Error('confirmation attempts must never reach the model');};
  for(const extra of [{text:'نعم'},{text:`موافق ${firstToken}`},{text:'نعم',replyToMessageId:'PROPOSAL-A'},{text:`موافق ${secondToken}`,replyToMessageId:'PROPOSAL-A'}]) {
    const result=await f.run(undefined,{...manager,...extra},noInference);
-   assert.equal(result.status,'clarify');assert.equal(pending(f.db).token,secondToken);
+   assert.equal(result.status,extra.text==='نعم'&&!extra.replyToMessageId?'confirmation':'clarify');assert.equal(pending(f.db).token,secondToken);
    assert.ok(f.db.prepare("SELECT id FROM tasks WHERE id='private'").get());
    assert.equal(f.db.prepare("SELECT title FROM tasks WHERE id='t'").get().title,'لوحة');
  }
@@ -318,14 +318,14 @@ test('inaccessible history cannot supply focus even when its result points to a 
  await f.run(undefined,{},async input=>{assert.equal(input.history.length,0);assert.equal(input.focusedTaskId,null);return emptySecretaryIntent('help');});
 });
 
-test('clarifying questions preserve the exact pending proposal and still need token or matching quote',async t=>{
+test('clarifying questions preserve the exact pending proposal and plain approval first restates it',async t=>{
  const f=fixture(t);await f.run(command('submit'),{text:'خلصت اللوحة بالكامل',responseMessageId:'PENDING-SUBMIT'});
  const before={...pending(f.db)};
  await f.run({...emptySecretaryIntent('chat','المهمة تذهب إلى باسم للمراجعة ولا تصبح معتمدة تلقائيًا.'),taskId:'t'},{text:'شو يعني بانتظار الاعتماد؟'});
  assert.deepEqual({...pending(f.db)},before);
  await f.run({...emptySecretaryIntent('clarify','بدك أوضح خطوة المراجعة؟'),taskId:'t'},{text:'وضح أكثر'});
  assert.deepEqual({...pending(f.db)},before);
- assert.equal((await f.run(undefined,{text:'نعم'})).status,'clarify');
+ assert.equal((await f.run(undefined,{text:'نعم'})).status,'confirmation');
  assert.equal(f.db.prepare("SELECT status FROM tasks WHERE id='t'").get().status,'progress');
  assert.equal(pending(f.db).token,before.token);
  assert.equal((await f.run(undefined,{text:`موافق ${before.token}`})).status,'applied');
@@ -355,10 +355,7 @@ test('owner private team message previews exact recipients and text then queues 
  assert.equal(first.status,'confirmation');assert.match(first.reply,/خالد/);assert.match(first.reply,/شادي/);assert.match(first.reply,/الاجتماع بكرا الساعة 10/);assert.match(first.reply,/لم أرسل شيئًا/);
  const jobs=createSecretaryOutboxJobs({db:f.db,config:f.config,now:()=>f.now});let sent=[];
  assert.equal((await jobs.deliverNext(async m=>{sent.push(m);})).status,'idle');
- const token=pending(f.db).token;
- assert.equal((await f.run(undefined,{...manager,text:'نعم'})).status,'clarify');
- assert.equal((await jobs.deliverNext(async m=>{sent.push(m);})).status,'idle');
- const queued=await f.run(undefined,{...manager,text:`موافق ${token}`});
+ const queued=await f.run(undefined,{...manager,text:'نعم'});
  assert.equal(queued.status,'queued');assert.match(queued.reply,/ليس تأكيد وصول/);
  for(let i=0;i<5;i++) await jobs.deliverNext(async m=>{sent.push(m);});
  const staff=sent.filter(m=>m.to!=='12025550103@s.whatsapp.net');

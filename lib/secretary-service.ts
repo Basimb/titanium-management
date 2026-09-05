@@ -15,6 +15,7 @@ type Snapshot = { tasks: Task[]; projects: Project[]; users: Array<ChatUser>; co
 type Event = TeamChatEnvelope & { replyToMessageId?: string | null; responseMessageId?: string | null };
 type Result = { status: string; reply: string; taskId?: string; batchId?: string; choices?: SecretaryChoices };
 type Pending = { token: string; command_json: string; snapshot_hash: string; original_text: string; source_message_id: string; expires_at: number };
+type ConfirmationView = { token: string; preview_event_key: string; requires_restatement: number };
 type HistoryRow = { original_text: string; result_json: string; scope_json: string };
 type TaskDraft = { projectId: string | null; title: string | null; details: string | null; priority: "red" | "yellow" | "green" | null; ownerId: string | null; dueDate: string | null };
 type IntakeRow = { draft_json: string; last_event_key: string; expires_at: number };
@@ -39,6 +40,7 @@ export function migrateSecretary(db: DatabaseSync) {
   db.exec(`CREATE TABLE IF NOT EXISTS secretary_events (event_key TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,actor_id TEXT NOT NULL,conversation_key TEXT NOT NULL,original_text TEXT NOT NULL,result_json TEXT NOT NULL,scope_json TEXT NOT NULL,created_at INTEGER NOT NULL,response_message_id TEXT);
     CREATE INDEX IF NOT EXISTS secretary_history ON secretary_events(conversation_key,created_at);
     CREATE TABLE IF NOT EXISTS secretary_pending (conversation_key TEXT PRIMARY KEY,token TEXT NOT NULL,command_json TEXT NOT NULL,snapshot_hash TEXT NOT NULL,original_text TEXT NOT NULL,source_message_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS secretary_confirmation_views (conversation_key TEXT PRIMARY KEY,token TEXT NOT NULL,preview_event_key TEXT NOT NULL,requires_restatement INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS secretary_task_intake (conversation_key TEXT PRIMARY KEY,draft_json TEXT NOT NULL,last_event_key TEXT NOT NULL,expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS secretary_reminders (id TEXT PRIMARY KEY,actor_id TEXT NOT NULL,sender_number TEXT NOT NULL,group_id TEXT,task_id TEXT NOT NULL,due_at INTEGER NOT NULL,state TEXT NOT NULL DEFAULT 'pending',created_at INTEGER NOT NULL,sent_at INTEGER,sending_at INTEGER,responded_at INTEGER,reply_message_id TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS secretary_reminders_due ON secretary_reminders(state,due_at);`);
@@ -76,10 +78,24 @@ function lookup(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot
   if (row.payload_hash !== eventHash(event) || row.actor_id !== actor.id || !scopeAllowed(JSON.parse(row.scope_json), state)) return { status: "denied", reply: "" };
   const result = JSON.parse(row.result_json);
   if (result.choices && (actor.id !== "basem" || actor.role !== "admin" || actor.active !== 1 || event.groupId !== null)) return { status: "denied", reply: "" };
+  if (result.status === "confirmation" || (result.status === "clarify" && isConfirmationAttempt(event.text))) {
+    const lastInstruction = String(result.reply).lastIndexOf("«موافق");
+    const legacy = /^«موافق (T[0-9A-F]{6})»/iu.exec(String(result.reply).slice(lastInstruction));
+    if (legacy) result.reply = visibleConfirmationReply(result.reply, legacy[1]);
+  }
   return { ...result, status: "duplicate" };
 }
 function save(db: DatabaseSync, event: Event, actor: ChatUser, result: Result, scope: string[], now: number) {
   const bounded = { ...result, reply: result.reply.slice(0, 3800) };
+  if (result.status === "confirmation") {
+    const key = conversation(event, actor);
+    const pending = db.prepare("SELECT token FROM secretary_pending WHERE conversation_key=?").get(key) as { token: string } | undefined;
+    if (!pending) throw new Error("Confirmation requires a pending proposal.");
+    const previous = confirmationView(db, key);
+    bounded.reply = visibleConfirmationReply(bounded.reply, pending.token);
+    db.prepare("INSERT INTO secretary_confirmation_views VALUES(?,?,?,?) ON CONFLICT(conversation_key) DO UPDATE SET token=excluded.token,preview_event_key=excluded.preview_event_key,requires_restatement=excluded.requires_restatement")
+      .run(key, pending.token, eventKey(event), previous && previous.token !== pending.token ? 1 : previous?.requires_restatement ?? 0);
+  }
   db.prepare("INSERT INTO secretary_events VALUES (?,?,?,?,?,?,?,?,?)").run(eventKey(event), eventHash(event), actor.id, conversation(event, actor), event.text, JSON.stringify(bounded), JSON.stringify(scope), now, event.responseMessageId ?? null);
   return bounded;
 }
@@ -178,6 +194,33 @@ function isAffirmation(text: string, token: string, matchingQuote: boolean) {
   return value === expected || AFFIRMATIONS.some(word => value === `${word} ${expected}`) || (matchingQuote && AFFIRMATIONS.includes(value));
 }
 function isCancellation(text: string) { return /^(?:لا|الغ[يِ]?|إلغاء|الغاء|ألغي|تراجع|cancel|no)[.!،\s]*$/iu.test(text.trim()); }
+function confirmationView(db: DatabaseSync, key: string): ConfirmationView | undefined {
+  return db.prepare("SELECT token,preview_event_key,requires_restatement FROM secretary_confirmation_views WHERE conversation_key=?").get(key) as ConfirmationView | undefined;
+}
+function clearConfirmationView(db: DatabaseSync, key: string) { db.prepare("DELETE FROM secretary_confirmation_views WHERE conversation_key=?").run(key); }
+function rememberPendingPreview(db: DatabaseSync, event: Event, key: string, pending: Pending | undefined) {
+  // Legacy pending proposals require a fresh visible preview before plain approval.
+  if (pending && !confirmationView(db, key)) db.prepare("INSERT INTO secretary_confirmation_views VALUES(?,?,?,1)")
+    .run(key, pending.token, eventKey({ ...event, messageId: pending.source_message_id }));
+}
+function visibleConfirmationReply(reply: string, token: string): string {
+  // Change only the last generated instruction, never the exact user-supplied outgoing body.
+  const instruction = `«موافق ${token}»`, at = reply.lastIndexOf(instruction);
+  return at < 0 ? reply : reply.slice(0, at) + "«موافق»" + reply.slice(at + instruction.length);
+}
+function restateConfirmation(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot, live: Pending, key: string, now: number): Result {
+  const source = db.prepare("SELECT result_json,scope_json FROM secretary_events WHERE event_key=? AND conversation_key=?")
+    .get(eventKey({ ...event, messageId: live.source_message_id }), key) as { result_json: string; scope_json: string } | undefined;
+  const original = source ? JSON.parse(source.result_json) as Result : null;
+  if (!source || original?.status !== "confirmation" || !scopeAllowed(JSON.parse(source.scope_json), state)) {
+    db.prepare("DELETE FROM secretary_pending WHERE conversation_key=? AND token=?").run(key, live.token); clearConfirmationView(db, key);
+    return save(db, event, actor, { status: "stale", reply: "ما قدرت أسترجع المعاينة الدقيقة؛ لم أنفّذ شيئًا. اذكر الطلب من جديد." }, [], now);
+  }
+  // This acknowledgement refreshes the exact visible proposal; a separate new reply must approve it.
+  db.prepare("INSERT INTO secretary_confirmation_views VALUES(?,?,?,0) ON CONFLICT(conversation_key) DO UPDATE SET token=excluded.token,preview_event_key=excluded.preview_event_key,requires_restatement=0")
+    .run(key, live.token, eventKey(event));
+  return save(db, event, actor, { ...original, reply: "للتأكد من الطلب الحالي، راجع هذه المعاينة ثم اكتب «موافق»:\n\n" + visibleConfirmationReply(original.reply, live.token) }, JSON.parse(source.scope_json), now);
+}
 
 function intakeRow(db: DatabaseSync, key: string): IntakeRow | undefined {
   return db.prepare("SELECT draft_json,last_event_key,expires_at FROM secretary_task_intake WHERE conversation_key=?").get(key) as IntakeRow | undefined;
@@ -235,7 +278,7 @@ function currentIntakeQuestion(db: DatabaseSync, event: Event, actor: ChatUser, 
   if (!live || live.expires_at <= now) return null;
   const draft = availableDraft(JSON.parse(live.draft_json), state);
   const question = intakeQuestion(draft, state);
-  if (!question) return { result: { status: "clarify", reply: "لم أنشئ المهمة؛ نحتاج معاينة نهائية ورمز تأكيد جديد قبل التنفيذ." }, scope: draft.projectId ? ["p:" + draft.projectId] : [] };
+  if (!question) return { result: { status: "clarify", reply: "لم أنشئ المهمة؛ نحتاج معاينة نهائية وموافقتك عليها قبل التنفيذ." }, scope: draft.projectId ? ["p:" + draft.projectId] : [] };
   const choices = event.groupId === null ? intakeChoices(db, actor, state, draft, key, now) : undefined;
   return { result: { status: "clarify", reply: question + (choices ? `\n\n${choices.options.map(option => option.label).join("\n")}\nاختار خيارًا واحدًا، أو اكتب اسم الخيار بالكلام.` : ""), ...(choices ? { choices } : {}) }, scope: draft.projectId ? ["p:" + draft.projectId] : [] };
 }
@@ -335,6 +378,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     const duplicate = lookup(db, event, freshActor, stateFor(db, freshActor)); if (duplicate) return duplicate;
     db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
     db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    clearConfirmationView(db, key);
     clearSecretaryChoices(db, key);
     return save(db, event, freshActor, { status: "cancelled", reply: "ألغيت مسودة المهمة. لم أنشئ مهمة أو أنفّذ طلبًا سابقًا." }, [], now);
   });
@@ -357,15 +401,29 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
       // Expiry is checked against the live row under the lock BEFORE displaying its token.
       if (live.expires_at <= now && !isCancellation(event.text)) {
         db.prepare("DELETE FROM secretary_pending WHERE conversation_key=? AND token=? AND expires_at<=?").run(key, live.token, now);
+        clearConfirmationView(db, key);
         clearSecretaryChoices(db, key);
         const currentQuestion = AFFIRMATIONS.includes(confirmationText(event.text)) ? currentIntakeQuestion(db, event, freshActor, state, key, now) : null;
         if (currentQuestion) return save(db, event, freshActor, currentQuestion.result, currentQuestion.scope, now);
         return save(db, event, freshActor, { status: "stale", reply: "انتهى وقت الطلب السابق؛ لم أنفّذ شيئًا. احكيلي المطلوب من جديد لنراجعه بتأكيد جديد." }, [], now);
       }
-      const matchingQuote = !!quote && quote.event_key === eventKey({ ...event, messageId: live.source_message_id }) && JSON.parse(quote.result_json).status === "confirmation";
-      if (quote && !matchingQuote) return save(db, event, freshActor, { status: "clarify", reply: "هذا الرد ليس على الطلب المعلّق الحالي. أكّد باستخدام رمز الطلب المعروض أمامك." }, [], now);
-      if (!isCancellation(event.text) && !isAffirmation(event.text, live.token, matchingQuote)) return save(db, event, freshActor, { status: "clarify", reply: `حتى ما أنفّذ طلبًا غير المقصود، اكتب «موافق ${live.token}» أو رد مباشرةً بالموافقة على رسالة هذا الطلب. لم أنفّذ أي تغيير.` }, [], now);
+      if (live.snapshot_hash !== fingerprint(state) && !isCancellation(event.text)) {
+        db.prepare("DELETE FROM secretary_pending WHERE conversation_key=? AND token=?").run(key, live.token); clearConfirmationView(db, key);
+        return save(db, event, freshActor, { status: "stale", reply: "تغيّرت البيانات أو الصلاحيات؛ لم أنفّذ الطلب. اذكره من جديد لأعرض الوضع الحالي." }, [], now);
+      }
+      const view = confirmationView(db, key);
+      const originalPreviewKey = eventKey({ ...event, messageId: live.source_message_id });
+      const matchingQuote = !!quote && JSON.parse(quote.result_json).status === "confirmation"
+        && (quote.event_key === originalPreviewKey || (view?.token === live.token && quote.event_key === view.preview_event_key));
+      if (quote && !matchingQuote) return save(db, event, freshActor, { status: "clarify", reply: "هذا الرد ليس على الطلب الحالي. رد بالموافقة على معاينته الحالية، أو اكتب «موافق» لأعيد عرضها قبل التنفيذ." }, [], now);
+      if (!isCancellation(event.text) && !isAffirmation(event.text, live.token, matchingQuote)) {
+        if (!AFFIRMATIONS.includes(confirmationText(event.text))) return save(db, event, freshActor, { status: "clarify", reply: "هذه الموافقة ليست للطلب الحالي. رد على معاينته الحالية، أو اكتب «موافق» لأراجعه معك." }, [], now);
+        const latest = db.prepare("SELECT event_key,result_json FROM secretary_events WHERE conversation_key=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(key) as { event_key: string; result_json: string } | undefined;
+        const latestMatches = view?.token === live.token && view.requires_restatement === 0 && !!latest && latest.event_key === view.preview_event_key && JSON.parse(latest.result_json).status === "confirmation";
+        if (!latestMatches) return restateConfirmation(db, event, freshActor, state, live, key, now);
+      }
       db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+      clearConfirmationView(db, key);
       clearSecretaryChoices(db, key);
       if (isCancellation(event.text)) { log(db, freshActor, event, "secretary_cancel", { summary: "ألغى الطلب قبل التنفيذ" }, now); return save(db, event, freshActor, { status: "cancelled", reply: "ألغيت الطلب المعلّق، ما غيّرت المهمة أو المشروع." }, [], now); }
       if (live.expires_at <= now || live.snapshot_hash !== fingerprint(state)) return save(db, event, freshActor, { status: "stale", reply: "انتهى وقت التأكيد أو تغيّرت البيانات/الصلاحيات. ما نفذت الطلب؛ اذكره من جديد لأعرض الوضع الحالي." }, [], now);
@@ -409,6 +467,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل أثناء قراءة رسالتك. ما عدّلتها؛ أعد الطلب لأراجع آخر وضع." }, [], now);
     if (hash(intakeRow(db, key) ?? null) !== hash(storedIntake ?? null)) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت مسودة المهمة أثناء قراءة رسالتك. لم أنشئ شيئًا؛ أعد آخر جواب لنكمل على التفاصيل الحالية." }, [], now);
     if ((plan.kind === "task_draft" || pendingDraft) && hash(db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) ?? null) !== hash(pending ?? null)) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت معاينة التأكيد أثناء قراءة رسالتك. لم أنشئ شيئًا؛ أعد التصحيح على المعاينة الحالية." }, [], now);
+    rememberPendingPreview(db, event, key, db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined);
     if (plan.kind === "task_draft") return taskIntake(db, event, freshActor, state, plan, key, taskDraft, now);
     // Only an explicit task_draft plan may continue intake; unrelated subjects cannot revive it later.
     if (storedIntake) db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);

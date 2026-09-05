@@ -52,10 +52,9 @@ test('intake asks one missing field at a time and preserves omitted known answer
   assert.equal(task.project_id,'p');assert.equal(task.title,complete.title);assert.equal(task.priority,'yellow');assert.equal(task.suggested_owner,'خالد');assert.equal(task.status,'open');
 });
 
-test('all facts in one request still need a new token or matching quoted preview',async t=>{
+test('all facts in one request still need a separate approval or matching quoted preview',async t=>{
   const f=fixture(t);const preview=await f.run(draft({...complete,details:'تفاصيل محفوظة كاملة'},'p'),{responseMessageId:'EXACT-PREVIEW'});
   assert.equal(preview.status,'confirmation');assert.match(preview.reply,/تفاصيل محفوظة كاملة/);assert.equal(tasks(f).length,1);
-  assert.equal((await f.run(undefined,{text:'تمام'})).status,'clarify');assert.equal(tasks(f).length,1);
   assert.equal((await f.run(undefined,{text:'موافق',replyToMessageId:'EXACT-PREVIEW'})).status,'applied');
   assert.equal(tasks(f).length,2);assert.equal(tasks(f).find(row=>row.id!=='existing').details,'تفاصيل محفوظة كاملة');
 });
