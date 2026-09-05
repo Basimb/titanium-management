@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { handleSecretaryEvent, migrateSecretary } from '../lib/secretary-service.ts';
 import { emptySecretaryIntent, validateSecretaryIntent, inferSecretaryIntent, searchSecretaryWeb } from '../lib/secretary-intent.ts';
 import { createSecretaryJobs } from '../lib/secretary-jobs.ts';
+import { createSecretaryOutboxJobs, getSecretaryOutboxStatus } from '../lib/secretary-outbox.ts';
 
 function fixture(t) {
   const db = new DatabaseSync(':memory:'); t.after(() => db.close());
@@ -26,6 +27,7 @@ function fixture(t) {
   return {db,config,event,run,get now(){return now;},tick:n=>{now+=n;}};
 }
 function command(action,fields={},taskId='t',projectId=null) { const p=emptySecretaryIntent('command');return {...p,action,taskId,projectId,fields:{...p.fields,...fields}}; }
+function teamMessage(text='الاجتماع بكرا الساعة 10',recipientIds=['all-team']) { const p=emptySecretaryIntent('message_team');p.fields.body=text;p.recipientIds=recipientIds;return p; }
 const pending = db => db.prepare('SELECT * FROM secretary_pending').get();
 
 test('secretary scoped friendly summary has direct link and no foreign data', async t=>{
@@ -258,4 +260,68 @@ test('conversational replies preserve negation and drafts but suppress clear inv
  assert.equal(f.db.prepare('SELECT count(*) n FROM comments').get().n,0);
  assert.equal((await f.run(command('delete_task'),{senderNumber:'12025550103',text:'كيف أحذف اللوحة؟'})).status,'clarify');
  assert.equal(pending(f.db),undefined);
+});
+
+test('owner private team message previews exact recipients and text then queues only after exact confirmation',async t=>{
+ const f=fixture(t);const manager={senderNumber:'12025550103',text:'ابعث للتيم على الخاص: الاجتماع بكرا الساعة 10',responseMessageId:'TEAM-PREVIEW'};
+ const first=await f.run(teamMessage(),manager,async input=>{
+   assert.equal(input.canMessageTeam,true);
+   assert.deepEqual(input.messageRecipients.map(x=>x.id).sort(),['member','other']);
+   assert.doesNotMatch(JSON.stringify(input),/1202555010/);
+   return teamMessage();
+ });
+ assert.equal(first.status,'confirmation');assert.match(first.reply,/خالد/);assert.match(first.reply,/شادي/);assert.match(first.reply,/الاجتماع بكرا الساعة 10/);assert.match(first.reply,/لم أرسل شيئًا/);
+ const jobs=createSecretaryOutboxJobs({db:f.db,config:f.config,now:()=>f.now});let sent=[];
+ assert.equal((await jobs.deliverNext(async m=>{sent.push(m);})).status,'idle');
+ const token=pending(f.db).token;
+ assert.equal((await f.run(undefined,{...manager,text:'نعم'})).status,'clarify');
+ assert.equal((await jobs.deliverNext(async m=>{sent.push(m);})).status,'idle');
+ const queued=await f.run(undefined,{...manager,text:`موافق ${token}`});
+ assert.equal(queued.status,'queued');assert.match(queued.reply,/ليس تأكيد وصول/);
+ for(let i=0;i<5;i++) await jobs.deliverNext(async m=>{sent.push(m);});
+ const staff=sent.filter(m=>m.to!=='12025550103@s.whatsapp.net');
+ assert.deepEqual(staff.map(m=>m.to).sort(),['12025550101@s.whatsapp.net','12025550102@s.whatsapp.net']);
+ assert.ok(staff.every(m=>m.text==='الاجتماع بكرا الساعة 10'));assert.ok(sent.every(m=>!m.to.endsWith('@g.us')));
+ assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM comments').get().n,0);
+ const status=await f.run(emptySecretaryIntent('message_status'),{...manager,text:'شو صار بالإرسال؟'});
+ assert.match(status.reply,/خالد|شادي/);assert.match(status.reply,/لا يعني أن الموظف قرأ/);assert.doesNotMatch(status.reply,/1202555010/);
+});
+
+test('team sends are denied to members and group-origin requests',async t=>{
+ const f=fixture(t);
+ for(const extra of [{text:'ابعث للتيم مرحبا'},{text:'ابعث للتيم مرحبا',senderNumber:'12025550103',groupId:'12345@g.us'}]) {
+   assert.equal((await f.run(teamMessage(),extra)).status,'clarify');assert.equal(pending(f.db),undefined);
+ }
+ const jobs=createSecretaryOutboxJobs({db:f.db,config:f.config,now:()=>f.now});
+ assert.equal((await jobs.deliverNext(async()=>{throw Error('must not send');})).status,'idle');
+});
+
+test('correction replaces preview with exact full draft context; old token and cancellation cannot send',async t=>{
+ const f=fixture(t);const manager={senderNumber:'12025550103'};
+ const long='تفاصيل تجريبية '.repeat(90);
+ await f.run(teamMessage(long,['member']),{...manager,text:'ابعث لخالد التفاصيل'});const old=pending(f.db).token;
+ await f.run(teamMessage('الاجتماع الساعة 11',['member']),{...manager,text:'لا خليها الساعة 11'},async input=>{
+   assert.equal(input.pendingMessagePreview.text,long.trim());assert.deepEqual(input.pendingMessagePreview.recipientIds,['member']);return teamMessage('الاجتماع الساعة 11',['member']);
+ });
+ assert.notEqual(pending(f.db).token,old);
+ assert.equal((await f.run(undefined,{...manager,text:`موافق ${old}`})).status,'clarify');
+ assert.equal((await f.run(undefined,{...manager,text:'إلغاء'})).status,'cancelled');
+ const jobs=createSecretaryOutboxJobs({db:f.db,config:f.config,now:()=>f.now});
+ assert.equal((await jobs.deliverNext(async()=>{throw Error('must not send');})).status,'idle');
+});
+
+test('duplicate message confirmation never enqueues twice; mapping changed after preview fails closed',async t=>{
+ const f=fixture(t);const manager={senderNumber:'12025550103'};
+ await f.run(teamMessage('اختبار',['member']),{...manager,text:'ابعث لخالد اختبار'});const token=pending(f.db).token;
+ f.config.contacts.find(x=>x.userId==='member').number='12025550999';
+ assert.equal((await f.run(undefined,{...manager,text:`موافق ${token}`})).status,'clarify');
+ const jobs=createSecretaryOutboxJobs({db:f.db,config:f.config,now:()=>f.now});assert.equal((await jobs.deliverNext(async()=>{throw Error('must not send');})).status,'idle');
+ f.config.contacts.find(x=>x.userId==='member').number='12025550101';
+ await f.run(teamMessage('اختبار جديد',['member']),{...manager,text:'ابعث لخالد اختبار جديد'});
+ const e=f.event({...manager,text:`موافق ${pending(f.db).token}`});const deps={infer:async()=>{throw Error('confirmation does not need model');},now:()=>f.now};
+ assert.equal((await handleSecretaryEvent(f.db,e,f.config,deps)).status,'queued');
+ assert.equal((await handleSecretaryEvent(f.db,e,f.config,deps)).status,'duplicate');
+ const s=getSecretaryOutboxStatus(f.db,{actor:{id:'basem',name:'باسم',role:'admin',active:1},origin:{senderNumber:manager.senderNumber,groupId:null}},f.config);
+ assert.equal(s.recipientCount,1);
 });

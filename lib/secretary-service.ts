@@ -5,12 +5,13 @@ import { resolveChatUser, normalizeContactNumber, type ChatUser } from "./team-c
 import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
 import { validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
+import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, SecretaryOutboxError } from "./secretary-outbox.ts";
 
 type Task = { id: string; projectId: string; title: string; details: string; status: string; priority: string; owner: string | null; suggestedOwner: string | null; dueDate: string | null; updatedAt: number | null; archivedAt: number | null };
 type Project = { id: string; name: string; status: string; updatedAt?: number | null; archivedAt?: number | null };
 type Snapshot = { tasks: Task[]; projects: Project[]; users: Array<ChatUser>; comments: Array<{ taskId: string; author: string; body: string; createdAt: number }> };
 type Event = TeamChatEnvelope & { replyToMessageId?: string | null; responseMessageId?: string | null };
-type Result = { status: string; reply: string; taskId?: string };
+type Result = { status: string; reply: string; taskId?: string; batchId?: string };
 type Pending = { token: string; command_json: string; snapshot_hash: string; original_text: string; source_message_id: string; expires_at: number };
 type HistoryRow = { original_text: string; result_json: string; scope_json: string };
 const ORIGIN = "https://www.management.titanium-pharmacy.com";
@@ -28,6 +29,7 @@ const eventHash = (event: Event) => hash([event.senderNumber, event.groupId, eve
 function transaction<T>(db: DatabaseSync, work: () => T): T { db.exec("BEGIN IMMEDIATE"); try { const result = work(); db.exec("COMMIT"); return result; } catch (error) { db.exec("ROLLBACK"); throw error; } }
 export function migrateSecretary(db: DatabaseSync) {
   migrateManagementActions(db);
+  migrateSecretaryOutbox(db);
   db.exec(`CREATE TABLE IF NOT EXISTS secretary_events (event_key TEXT PRIMARY KEY,payload_hash TEXT NOT NULL,actor_id TEXT NOT NULL,conversation_key TEXT NOT NULL,original_text TEXT NOT NULL,result_json TEXT NOT NULL,scope_json TEXT NOT NULL,created_at INTEGER NOT NULL,response_message_id TEXT);
     CREATE INDEX IF NOT EXISTS secretary_history ON secretary_events(conversation_key,created_at);
     CREATE TABLE IF NOT EXISTS secretary_pending (conversation_key TEXT PRIMARY KEY,token TEXT NOT NULL,command_json TEXT NOT NULL,snapshot_hash TEXT NOT NULL,original_text TEXT NOT NULL,source_message_id TEXT NOT NULL,expires_at INTEGER NOT NULL);
@@ -182,12 +184,24 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
       if (isCancellation(event.text)) { log(db, freshActor, event, "secretary_cancel", { summary: "ألغى الطلب قبل التنفيذ" }, now); return save(db, event, freshActor, { status: "cancelled", reply: "ألغيت الطلب المعلّق، ما غيّرت المهمة أو المشروع." }, [], now); }
       if (live.expires_at <= now || live.snapshot_hash !== fingerprint(state)) return save(db, event, freshActor, { status: "stale", reply: "انتهى وقت التأكيد أو تغيّرت البيانات/الصلاحيات. ما نفذت الطلب؛ اذكره من جديد لأعرض الوضع الحالي." }, [], now);
       const command = JSON.parse(live.command_json);
+      if (command.action === "message_team") {
+        try {
+          const batch = confirmSecretaryOutboxPreview(db, { batchId: command.batchId, actor: freshActor,
+            origin: { senderNumber: event.senderNumber, groupId: event.groupId }, confirmationMessageId: eventKey(event) }, config, { now });
+          log(db, freshActor, event, "secretary_message_queued", { summary: "أكد إرسال رسالة منفصلة للموظفين", batchId: batch.batchId, recipientCount: batch.recipientCount, sourceMessageId: live.source_message_id }, now);
+          return save(db, event, freshActor, { status: "queued", batchId: batch.batchId, reply: `أكدت الطلب وأضفت الرسالة لطابور الإرسال على الخاص إلى ${batch.recipientCount} موظفين، كل واحد لحاله. هذا ليس تأكيد وصول؛ رح يوصلك تقرير بنتيجة الإرسال.` }, [], now);
+        } catch (error) { if (!(error instanceof SecretaryOutboxError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
+      }
       if (command.action === "schedule_reminder") return reminder(db, event, freshActor, state, command.taskId, command.dueAt, now);
       return perform(db, event, freshActor, state, command, now, { originalText: live.original_text, sourceMessageId: live.source_message_id, confirmationRequired: true, confirmedBy: freshActor.id, confirmationMessageId: event.messageId });
     });
   }
   const history = boundedHistory(historyRows, quote);
+  const canMessageTeam = actor.id === "basem" && actor.role === "admin" && event.groupId === null;
+  const pendingCommand = canMessageTeam && pending && pending.expires_at > now ? JSON.parse(pending.command_json) : null;
   const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId,
+    canMessageTeam, messageRecipients: canMessageTeam ? getSecretaryOutboxRecipients(db, config).map(user => ({ id: user.userId, name: user.name })) : [],
+    pendingMessagePreview: pendingCommand?.action === "message_team" && typeof pendingCommand.text === "string" && Array.isArray(pendingCommand.recipientIds) ? { text: pendingCommand.text, recipientIds: pendingCommand.recipientIds } : null,
     tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status })),
     projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString() };
   const plan = validateSecretaryIntent(await dependencies.infer(input), input);
@@ -203,7 +217,27 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
     const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
     if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل أثناء قراءة رسالتك. ما عدّلتها؛ أعد الطلب لأراجع آخر وضع." }, [], now);
-    if (plan.kind === "command" || plan.kind === "remind") db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    if (plan.kind === "message_status") {
+      try {
+        const batch = getSecretaryOutboxStatus(db, { actor: freshActor, origin: { senderNumber: event.senderNumber, groupId: event.groupId } }, config);
+        const labels: Record<string,string> = { queued: "بانتظار الإرسال", sending: "جارٍ الإرسال", sent: "قُبل إرسالها عبر واتساب", failed: "لم تُرسل", uncertain: "النتيجة غير مؤكدة؛ لن نكررها تلقائيًا" };
+        return save(db, event, freshActor, { status: "summary", ...(batch ? { batchId: batch.batchId } : {}), reply: batch ? `نتيجة آخر رسالة مؤكدة للتيم:\n${batch.recipients.map(user => `• ${clean(user.name, 80)}: ${labels[user.state] || "غير معروف"}`).join("\n")}\nقبول واتساب لا يعني أن الموظف قرأ الرسالة.` : "ما في رسالة مؤكدة للتيم مسجّلة بعد." }, [], now);
+      } catch(error) { if (!(error instanceof SecretaryOutboxError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
+    }
+    if (plan.kind === "command" || plan.kind === "remind" || plan.kind === "message_team") db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    if (plan.kind === "message_team") {
+      try {
+        const preview = createSecretaryOutboxPreview(db, { actor: freshActor, origin: { senderNumber: event.senderNumber, groupId: event.groupId },
+          sourceMessageId: eventKey(event), text: plan.fields.body || "", recipientIds: plan.recipientIds[0] === "all-team" ? "all-team" : plan.recipientIds }, config, { now });
+        const token = "T" + randomBytes(3).toString("hex").toUpperCase();
+        const reply = `${event.inputKind === "voice" ? "فهمت من الصوت الطلب التالي:\n" : ""}رح أرسل من رقم الإدارة لكل موظف لحاله على الخاص، وليس على الجروب.\nالمستلمون: ${preview.recipients.map(user => user.name).join("، ")}\n\nالنص الذي سيُرسل:\n${preview.text}\n\nلم أرسل شيئًا بعد. اكتب «موافق ${token}» أو رد بالموافقة مباشرة على هذه المعاينة؛ وللتراجع اكتب «إلغاء». التأكيد صالح 10 دقائق.`;
+        if (reply.length > 3700) return save(db, event, freshActor, { status: "clarify", reply: "المعاينة طويلة؛ اختصر نص الرسالة أو اختر عددًا أقل من المستلمين حتى أعرضها كاملة قبل التأكيد." }, [], now);
+        const command = { action: "message_team", batchId: preview.batchId, text: preview.text, recipientIds: preview.recipients.map(user => user.userId) };
+        db.prepare("INSERT INTO secretary_pending VALUES(?,?,?,?,?,?,?)").run(key, token, JSON.stringify(command), initialHash, event.text, event.messageId, now + CONFIRM_MS);
+        log(db, freshActor, event, "secretary_message_preview", { summary: "عرض رسالة للتيم قبل الإرسال", batchId: preview.batchId, recipientIds: preview.recipients.map(user => user.userId), confirmationRequired: true }, now);
+        return save(db, event, freshActor, { status: "confirmation", batchId: preview.batchId, reply }, [], now);
+      } catch(error) { if (!(error instanceof SecretaryOutboxError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
+    }
     if (plan.kind === "command") {
       const command = commandFrom(plan, state);
       if (freshActor.id !== "basem" && !["claim", "cancel_claim", "comment", "submit"].includes(String(command.action))) return save(db, event, freshActor, { status: "denied", reply: "هذا القرار من صلاحيات باسم. أقدر أساعدك بتحديث مهامك أو إرسالها للمراجعة." }, [], now);

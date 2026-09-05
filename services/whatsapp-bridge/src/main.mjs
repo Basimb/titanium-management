@@ -6,6 +6,7 @@ import { createBridgeRuntime } from './runtime.mjs';
 import { createContactAuthorizer } from './group-privacy.mjs';
 import { openControl } from './control.mjs';
 import { createVoiceTranscriber } from './voice.mjs';
+import { readOutboxConfig } from './launch-private.mjs';
 
 async function main() {
   if (process.env.TEAM_CHAT_BRIDGE_ENABLED !== '1') {
@@ -23,6 +24,7 @@ async function main() {
   control.recover();
   let isActiveNumber = () => false;
   let secretaryJobs;
+  let secretaryOutbox;
   if (process.env.TEAM_CHAT_AUTH_DATABASE) {
     const { DatabaseSync } = await import('node:sqlite');
     const { lstatSync, realpathSync } = await import('node:fs');
@@ -36,10 +38,13 @@ async function main() {
     isActiveNumber = createContactAuthorizer({ db: authorizationDb, contacts: () => contacts });
     if (process.env.SECRETARY_ENABLED === '1') {
       const { createSecretaryJobs } = await import('../../../lib/secretary-jobs.ts');
+      const { createSecretaryOutboxJobs } = await import('../../../lib/secretary-outbox.ts');
       const jobsDb = new DatabaseSync(filename);
       jobsDb.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;');
       secretaryJobs = createSecretaryJobs({ db: jobsDb, config: { enabled: true,
         contacts, allowedGroupIds: [...config.allowedGroups] } });
+      const outboxSettingsPath = process.env.TEAM_CHAT_AUTH_CONFIG_PATH;
+      secretaryOutbox = createSecretaryOutboxJobs({ db: jobsDb, config: () => readOutboxConfig(outboxSettingsPath) });
     }
   }
   let otpQueue;
@@ -58,7 +63,7 @@ async function main() {
   }
   const runtime = createBridgeRuntime({
     config, store, auth, makeWASocket, jidNormalizedUser, makeCacheableSignalKeyStore, DisconnectReason, logger, otpQueue,
-    control, isActiveNumber, secretaryJobs,
+    control, isActiveNumber, secretaryJobs, secretaryOutbox,
     ...(config.voiceEnabled ? { transcribeVoice: createVoiceTranscriber({ apiKey: process.env.GROQ_API_KEY, downloadContent: downloadContentFromMessage }) } : {}),
     onStop: code => { process.exitCode = code === 'service_shutdown' ? 0 : 78; },
   });

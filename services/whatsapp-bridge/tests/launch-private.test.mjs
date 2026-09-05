@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { readPrivateConfig, bridgeChildEnvironment, launchPrivate } from '../src/launch-private.mjs';
+import { readPrivateConfig, readOutboxConfig, bridgeChildEnvironment, launchPrivate } from '../src/launch-private.mjs';
 
 const serviceDirectory = path.join(os.tmpdir(), 'private-launch-repo', 'services', 'whatsapp-bridge');
 const configFile = path.join(os.tmpdir(), 'private-launch-settings.json');
@@ -103,6 +103,67 @@ test('child receives normalized allowlists and no Groq/config/inherited runtime 
     assert.equal(Object.hasOwn(child, name), false);
   }
   assert.equal(JSON.stringify(child).includes('synthetic-secret'), false);
+});
+
+test('outbox policy re-reads remapping, contact flags and disable switches without retaining private settings', () => {
+  const current = { ...settings, SECRETARY_ENABLED: '1' };
+  const f = fixture({ SECRETARY_ENABLED: '1' });
+  assert.deepEqual(readOutboxConfig(configFile, f.fs), { enabled: true, contacts: [{ userId: 'test-user', number: '15551234567' }] });
+  for (const contact of [
+    { userId: 'replacement', number: '15551234567', name: 'SYNTHETIC_PRIVATE_NAME' },
+    { userId: 'test-user', number: '15551230000' },
+    { userId: 'test-user', number: '15551234567', active: false },
+    { userId: 'test-user', number: '15551234567', verified: false },
+  ]) {
+    f.put(configFile, JSON.stringify({ ...current, TEAM_CHAT_CONTACTS_JSON: JSON.stringify([contact]) }));
+    const policy = readOutboxConfig(configFile, f.fs);
+    assert.deepEqual(policy, { enabled: true, contacts: [{ userId: contact.userId, number: contact.number,
+      ...(contact.active === false ? { active: false } : {}), ...(contact.verified === false ? { verified: false } : {}) }] });
+    assert.doesNotMatch(JSON.stringify(policy), /SYNTHETIC_PRIVATE_NAME|synthetic-secret|GROQ|SHARED_KEY/);
+  }
+  for (const change of [{ TEAM_CHAT_ENABLED: '0' }, { SECRETARY_ENABLED: '0' }]) {
+    f.put(configFile, JSON.stringify({ ...current, ...change }));
+    assert.deepEqual(readOutboxConfig(configFile, f.fs), { enabled: false, contacts: [] });
+  }
+});
+
+test('outbox policy fails closed for missing, unsafe or malformed live settings and ambiguous mapping', () => {
+  const f = fixture({ SECRETARY_ENABLED: '1' });
+  for (const filename of [undefined, '', 'relative.json', path.join(os.tmpdir(), 'missing-private-settings.json')]) {
+    assert.deepEqual(readOutboxConfig(filename, f.fs), { enabled: false, contacts: [] });
+  }
+  for (const contacts of [null, {}, [{ userId: 'u', number: '15551234567', active: 'false' }],
+    [{ userId: 'u', number: '15551234567' }, { userId: 'v', number: '15551234567' }],
+    [{ userId: 'u', number: '15551234567' }, { userId: 'u', number: '15551230000' }]]) {
+    f.put(configFile, JSON.stringify({ ...settings, SECRETARY_ENABLED: '1', TEAM_CHAT_CONTACTS_JSON: JSON.stringify(contacts) }));
+    assert.deepEqual(readOutboxConfig(configFile, f.fs), { enabled: false, contacts: [] });
+  }
+  for (const extra of [{ mode: 0o100644 }, { symlink: true }, { content: Buffer.from('SYNTHETIC_SECRET_INVALID_JSON') }]) {
+    f.put(configFile, JSON.stringify({ ...settings, SECRETARY_ENABLED: '1' }), extra);
+    assert.deepEqual(readOutboxConfig(configFile, f.fs), { enabled: false, contacts: [] });
+  }
+});
+
+test('only launcher-validated settings path is explicitly granted to outbox, never an inherited path override', async () => {
+  const database = path.join(os.tmpdir(), 'otp-test.sqlite');
+  const f = fixture({ SECRETARY_ENABLED: '1', WHATSAPP_LOGIN_DATABASE: database });
+  const untrusted = { ...env, TEAM_CHAT_AUTH_CONFIG_PATH: path.join(os.tmpdir(), 'untrusted-other-file') };
+  const built = bridgeChildEnvironment({ ...settings, SECRETARY_ENABLED: '1', WHATSAPP_LOGIN_DATABASE: database }, untrusted, false, serviceDirectory);
+  assert.equal(built.TEAM_CHAT_AUTH_CONFIG_PATH, undefined);
+  const pending = launchPrivate({ ...f.dependencies, env: untrusted, args: [] });
+  assert.equal(f.spawns.length, 1);
+  const childEnv = f.spawns[0][2].env;
+  assert.equal(childEnv.TEAM_CHAT_AUTH_CONFIG_PATH, configFile);
+  assert.equal(childEnv.TITANIUM_TEAM_CHAT_CONFIG, undefined);
+  assert.equal(childEnv.GROQ_API_KEY, undefined);
+  assert.equal(childEnv.NODE_OPTIONS, undefined);
+  assert.doesNotMatch(JSON.stringify(childEnv), /synthetic-secret|untrusted-other-file/);
+  f.child.emit('close', 0, null);
+  assert.equal(await pending, 0);
+  const unsafe = fixture({ SECRETARY_ENABLED: '1', WHATSAPP_LOGIN_DATABASE: database });
+  unsafe.entries.get(configFile).symlink = true;
+  assert.equal(await launchPrivate({ ...unsafe.dependencies, args: [] }), 78);
+  assert.equal(unsafe.spawns.length, 0);
 });
 
 test('OTP worker gets only its private secret and contacts, never Groq', () => {

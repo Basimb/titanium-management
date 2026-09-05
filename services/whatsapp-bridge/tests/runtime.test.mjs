@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import * as baileys from 'baileys';
@@ -15,7 +15,7 @@ const member = '15551234567';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
 function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false, otpQueue,
-  isActiveNumber = number => number === member, control, secretaryJobs } = {}) {
+  isActiveNumber = number => number === member, control, secretaryJobs, secretaryOutbox } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'titanium-bridge-runtime-test-'));
   const store = openStore(directory);
   const logger = pino({ level: 'silent' });
@@ -36,7 +36,7 @@ function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false
     clearInterval(job) { if (job) job.cleared = true; },
   };
   const runtime = createBridgeRuntime({
-    ...baileys, config, store, auth, logger, now: () => clock, timers, otpQueue, isActiveNumber, control, secretaryJobs,
+    ...baileys, config, store, auth, logger, now: () => clock, timers, otpQueue, isActiveNumber, control, secretaryJobs, secretaryOutbox,
     makeWASocket(options) {
       // Never call the actual Baileys factory. Every network-capable method is mocked.
       const socket = { options, ev: new EventEmitter(), authState: options.auth, pairCalls: [], endCalls: 0,
@@ -223,6 +223,157 @@ test('OTP has priority over secretary jobs and disabled task automation pauses s
   second.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
   second.intervals[0].fn(); await flush();
   assert.equal(jobs, 0);
+});
+
+test('private outbox sends exact approved text only on the verified linked account without pairing or content logs', async t => {
+  const text = 'نص تجريبي وافق عليه صاحب الطلب\nرسالة خاصة لكل موظف.';
+  const owner = '15551230000';
+  let calls = 0;
+  const h = harness(t, { isActiveNumber: number => [owner, member].includes(number), secretaryOutbox: { async deliverNext(send) {
+    calls++;
+    await send({ to: `${member}@s.whatsapp.net`, text, messageId: 'TITANIUMOUT_SYNTHETIC', signal: new AbortController().signal });
+    await send({ to: `${owner}@s.whatsapp.net`, text: 'SYNTHETIC_PRIVATE_RECEIPT', messageId: 'TITANIUMOUTSUMMARY_SYNTHETIC', signal: new AbortController().signal });
+    return { status: 'sent' };
+  } } });
+  h.config.allowedNumbers.add(owner);
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  const sent = [];
+  socket.sendMessage = async (...args) => sent.push(args);
+  h.intervals[0].fn(); await flush();
+  assert.equal(calls, 0);
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(calls, 1);
+  assert.deepEqual(sent[0], [`${member}@s.whatsapp.net`, { text, linkPreview: null }, { messageId: 'TITANIUMOUT_SYNTHETIC' }]);
+  assert.equal(sent[1][0], `${owner}@s.whatsapp.net`);
+  assert.deepEqual(socket.pairCalls, []);
+  assert.deepEqual(h.stopped, []);
+  assert.ok(h.auth.state.creds.registered);
+  assert.doesNotMatch(h.output.join('\n'), /1555|SYNTHETIC|نص تجريبي/);
+  assert.match(h.output.join('\n'), /Titanium secretary outbox: sent/);
+});
+
+test('private outbox rejects every group, noncanonical recipient, revoked user, altered text and invalid send identifier', async t => {
+  const group = '120363000000000000@g.us';
+  const disabled = '15551230000';
+  const h = harness(t, { secretaryOutbox: { async deliverNext(send) {
+    for (const override of [
+      ...[group, `${member}@lid`, 'status@broadcast', `${member}@newsletter`, member, `+${member}@s.whatsapp.net`,
+        `${botNumber}@s.whatsapp.net`, '15559999999@s.whatsapp.net', `${disabled}@s.whatsapp.net`].map(to => ({ to })),
+      { messageId: 'bad identifier' }, { messageId: '' }, { text: 'changed\u202etext' }, { text: ' text ' },
+      { text: 'a\r\nb' }, { text: 'x'.repeat(4001) }, { text: '' }, { signal: AbortSignal.abort() },
+    ]) await assert.rejects(() => send({ to: `${member}@s.whatsapp.net`, text: 'SYNTHETIC_PRIVATE_TEXT',
+      messageId: 'TITANIUMOUT_SYNTHETIC', signal: new AbortController().signal, ...override }));
+    return { status: 'failed' };
+  } } });
+  h.config.allowedGroups.add(group);
+  h.config.allowedNumbers.add(disabled);
+  h.config.allowedNumbers.add(botNumber); // A malformed allowlist must not permit self-send.
+  await h.runtime.start();
+  h.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.deepEqual(h.stopped, []);
+  assert.match(h.output.join('\n'), /Titanium secretary outbox: failed/);
+});
+
+test('private outbox rechecks connection and allowlist after asynchronous account authorization', async t => {
+  let authorize;
+  const h = harness(t, { isActiveNumber: () => new Promise(resolve => { authorize = resolve; }),
+    secretaryOutbox: { async deliverNext(send) {
+      await assert.rejects(() => send({ to: `${member}@s.whatsapp.net`, text: 'PRIVATE', messageId: 'TITANIUMOUT_RACE', signal: new AbortController().signal }));
+      return { status: 'failed' };
+    } } });
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush();
+  assert.equal(typeof authorize, 'function');
+  h.config.allowedNumbers.delete(member);
+  socket.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { output: { statusCode: 408 } } } });
+  authorize(true); await flush(); await flush();
+  assert.equal(h.runtime.status().ready, false);
+  assert.deepEqual(h.stopped, []);
+});
+
+test('aborted ambiguous outbox delivery does not hang or tear down subsequent OTP delivery', async t => {
+  const controller = new AbortController();
+  let otpReady = false;
+  const h = harness(t, { otpQueue: { async deliverNext(send) {
+    if (!otpReady) return { status: 'idle' };
+    await send({ to: member, code: '012345', challengeId: 'synthetic', expiresAt: clock + 300000, signal: new AbortController().signal });
+    return { status: 'sent' };
+  } }, secretaryOutbox: { async deliverNext(send) {
+    await assert.rejects(() => send({ to: `${member}@s.whatsapp.net`, text: 'SYNTHETIC_HUNG_SEND', messageId: 'TITANIUMOUT_HUNG', signal: controller.signal }));
+    return { status: 'uncertain' };
+  } } });
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  const sent = [];
+  socket.sendMessage = async (...args) => {
+    if (args[1].text === 'SYNTHETIC_HUNG_SEND') { controller.abort(); return new Promise(() => {}); }
+    sent.push(args);
+  };
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.match(h.output.join('\n'), /outbox: uncertain/);
+  otpReady = true;
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(sent.length, 1);
+  assert.match(sent[0][1].text, /012345/);
+  assert.deepEqual(h.stopped, []);
+  assert.doesNotMatch(h.output.join('\n'), /012345|SYNTHETIC_HUNG_SEND/);
+});
+
+test('OTP stays first while inbox replies, outbox and reminders take fair turns under sustained backlogs', async t => {
+  let otpPending = true;
+  const order = [];
+  const job = text => ({ async deliverNext(send) {
+    await send({ to: `${member}@s.whatsapp.net`, text, messageId: `SYNTHETIC_${text}`, signal: new AbortController().signal });
+    return { status: 'sent' };
+  } });
+  const h = harness(t, { otpQueue: { async deliverNext() {
+    if (!otpPending) return { status: 'idle' };
+    otpPending = false; order.push('OTP'); return { status: 'sent' };
+  } }, secretaryOutbox: job('OUTBOX'), secretaryJobs: job('REMINDER') });
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  socket.sendMessage = async (_jid, content) => order.push(content.text);
+  for (let index = 0; index < 6; index++) {
+    const messageId = `INBOX_${index}`;
+    h.store.enqueue({ chatJid: `${member}@s.whatsapp.net`, body: { messageId, senderNumber: member, groupId: null, text: 'مرحبا', receivedAt: clock } });
+    const row = h.store.db.prepare("SELECT id FROM inbox WHERE json_extract(raw_body,'$.messageId')=?").get(messageId);
+    h.store.backendResult(row.id, { status: 'summary', reply: 'INBOX' });
+  }
+  for (let tick = 0; tick < 7; tick++) { h.intervals[0].fn(); await flush(); await flush(); }
+  assert.deepEqual(order, ['OTP', 'INBOX', 'OUTBOX', 'INBOX', 'REMINDER', 'INBOX', 'OUTBOX']);
+  assert.deepEqual(h.stopped, []);
+});
+
+test('disabled tasks pause outbox and a worker error never leaks raw errors or stops login', async t => {
+  let calls = 0;
+  const h = harness(t, { secretaryOutbox: { async deliverNext() { calls++; throw new Error('SYNTHETIC_SECRET_WORKER_FAILURE'); } } });
+  h.config.tasksEnabled = false;
+  await h.runtime.start();
+  h.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush();
+  assert.equal(calls, 0);
+  h.config.tasksEnabled = true;
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(calls, 1);
+  assert.deepEqual(h.stopped, []);
+  assert.equal(h.runtime.status().ready, true);
+  assert.doesNotMatch(h.output.join('\n'), /SYNTHETIC_SECRET_WORKER_FAILURE/);
+});
+
+test('startup wires outbox into the same explicitly configured management database, not linked-device auth storage', () => {
+  const source = readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8');
+  assert.match(source, /createSecretaryOutboxJobs.*import\('\.\.\/\.\.\/\.\.\/lib\/secretary-outbox\.ts'\)/);
+  assert.match(source, /const outboxSettingsPath = process\.env\.TEAM_CHAT_AUTH_CONFIG_PATH/);
+  assert.match(source, /secretaryOutbox = createSecretaryOutboxJobs\(\{ db: jobsDb, config: \(\) => readOutboxConfig\(outboxSettingsPath\) \}\)/);
+  assert.match(source, /control, isActiveNumber, secretaryJobs, secretaryOutbox/);
+  assert.doesNotMatch(source, /authDelete|logout\(/);
 });
 
 test('unsafe group gets only one generic private refusal to verified sender, no report in group', async t => {

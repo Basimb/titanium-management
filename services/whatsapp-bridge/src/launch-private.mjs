@@ -54,6 +54,33 @@ function normalizedContact(value) {
   return /^[1-9]\d{7,14}$/.test(result) ? result : null;
 }
 
+// Re-read on every outbox authorization check. Return only the transport policy,
+// never the full settings object, provider keys, names or database paths.
+export function readOutboxConfig(filename, fs = nativeFs) {
+  const disabled = { enabled: false, contacts: [] };
+  try {
+    const settings = readPrivateConfig(filename, fs);
+    if (settings.TEAM_CHAT_ENABLED !== '1' || settings.SECRETARY_ENABLED !== '1') return disabled;
+    const raw = JSON.parse(settings.TEAM_CHAT_CONTACTS_JSON || '[]');
+    if (!Array.isArray(raw) || raw.length > 100) return disabled;
+    const contacts = [];
+    const numbers = new Set();
+    const users = new Set();
+    for (const contact of raw) {
+      if (!contact || typeof contact !== 'object' || Array.isArray(contact) ||
+        typeof contact.userId !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(contact.userId) ||
+        (contact.active !== undefined && typeof contact.active !== 'boolean') ||
+        (contact.verified !== undefined && typeof contact.verified !== 'boolean')) return disabled;
+      const number = normalizedContact(contact.number);
+      if (!number || numbers.has(number) || users.has(contact.userId)) return disabled;
+      numbers.add(number); users.add(contact.userId);
+      contacts.push({ userId: contact.userId, number,
+        ...(contact.active === false ? { active: false } : {}), ...(contact.verified === false ? { verified: false } : {}) });
+    }
+    return { enabled: true, contacts };
+  } catch { return disabled; }
+}
+
 export function bridgeChildEnvironment(settings, env, pair, serviceDirectory = SERVICE_DIRECTORY) {
   const contacts = JSON.parse(settings.TEAM_CHAT_CONTACTS_JSON || '[]');
   const groups = JSON.parse(settings.TEAM_CHAT_GROUP_IDS_JSON || '[]');
@@ -93,7 +120,8 @@ export function bridgeChildEnvironment(settings, env, pair, serviceDirectory = S
     if (typeof settings.GROQ_API_KEY !== 'string' || !settings.GROQ_API_KEY.trim() || /[\r\n]/.test(settings.GROQ_API_KEY)) throw new Error('Voice settings unavailable.');
     childEnv.GROQ_API_KEY = settings.GROQ_API_KEY;
   }
-  // Phone/user mapping only; no names, AI key, or protected config path crosses into the transport.
+  // Phone/user mapping only; no names or AI key. launchPrivate separately grants
+  // the validated settings path for fresh outbox authorization, never from an override.
   if (path.isAbsolute(settings.WHATSAPP_LOGIN_DATABASE || '')) {
     childEnv.TEAM_CHAT_AUTH_DATABASE = settings.WHATSAPP_LOGIN_DATABASE;
     childEnv.TEAM_CHAT_AUTH_CONTACTS_JSON = JSON.stringify(contacts.map(contact => ({
@@ -148,9 +176,13 @@ export async function launchPrivate({ env = process.env, args = process.argv.sli
   try {
     if (args.length > 1 || (args.length === 1 && args[0] !== '--pair')) throw new Error();
     const pair = args[0] === '--pair';
-    const settings = readPrivateConfig(env.TITANIUM_TEAM_CHAT_CONFIG, fs);
+    const settingsPath = env.TITANIUM_TEAM_CHAT_CONFIG;
+    const settings = readPrivateConfig(settingsPath, fs);
     if (!pair && settings.TEAM_CHAT_ENABLED !== '1' && !['1', 'pilot'].includes(settings.WHATSAPP_LOGIN_ENABLED)) return 0;
     const childEnv = bridgeChildEnvironment(settings, env, pair, serviceDirectory);
+    if (childEnv.SECRETARY_ENABLED === '1' && childEnv.TEAM_CHAT_AUTH_DATABASE) {
+      childEnv.TEAM_CHAT_AUTH_CONFIG_PATH = path.resolve(settingsPath);
+    }
     const directory = path.resolve(childEnv.TEAM_CHAT_STATE_DIR);
     privateStateDirectory(directory, fs);
     const marker = path.join(directory, 'needs-attention.marker');

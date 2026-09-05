@@ -54,3 +54,15 @@ test('a model cannot turn clearly framed discussion into a write or reminder', (
   comment.fields.body='ما رد المورد لسه';
   assert.equal(validateSecretaryIntent(comment,input('سجل تعليق: ما رد المورد لسه')).kind,'command');
 });
+
+test('team messaging schema accepts only authorized staff IDs or the exclusive all-team marker',()=>{
+ const context={...input('ابعث للتيم على الخاص مرحبا'),canMessageTeam:true,messageRecipients:[{id:'employee-one',name:'موظف تجريبي'}]};
+ const plan=emptySecretaryIntent('message_team');plan.fields.body='مرحبا';plan.recipientIds=['all-team'];
+ assert.equal(validateSecretaryIntent(plan,context).kind,'message_team');
+ assert.equal(validateSecretaryIntent({...plan,recipientIds:['employee-one']},context).kind,'message_team');
+ for(const ids of [['all-team','employee-one'],['12025550101'],['basem'],['unknown']]) assert.equal(validateSecretaryIntent({...plan,recipientIds:ids},context).kind,'clarify');
+ assert.equal(validateSecretaryIntent(plan,{...context,canMessageTeam:false}).kind,'clarify');
+ assert.equal(validateSecretaryIntent(plan,{...context,text:'اكتب مسودة رسالة للتيم'}).kind,'clarify');
+ assert.equal(validateSecretaryIntent({...plan,fields:{...plan.fields,body:null}},context).kind,'clarify');
+ assert.throws(()=>validateSecretaryIntent({...plan,recipientIds:['employee-one','employee-one']},context));
+});

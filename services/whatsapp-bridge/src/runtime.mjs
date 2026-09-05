@@ -16,7 +16,7 @@ function withDeadline(work) {
 export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNormalizedUser,
   makeCacheableSignalKeyStore, DisconnectReason, logger, onStop = () => {}, output = console,
   now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch, otpQueue,
-  control, isActiveNumber = () => false, secretaryJobs, transcribeVoice }) {
+  control, isActiveNumber = () => false, secretaryJobs, secretaryOutbox, transcribeVoice }) {
   let socket;
   let ready = false;
   let stopped = false;
@@ -27,6 +27,8 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   let incomingChain = Promise.resolve();
   let reconnectTimer;
   let pairRequested = false;
+  let preferBackground = false;
+  let preferOutbox = true;
   const groupCache = new Map();
   const groupEpoch = new Map();
 
@@ -179,6 +181,76 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
     });
   }
 
+  async function sendScheduled({ to, text, messageId, signal }, privateOnly = false) {
+    const current = socket;
+    if (!ready || stopped || !signal || signal.aborted || typeof messageId !== 'string' ||
+      !/^[a-zA-Z0-9_-]{1,200}$/.test(messageId)) throw new Error('secretary_delivery_unavailable');
+    const reply = boundedPlainText(text);
+    if (!reply || (privateOnly && reply !== text)) throw new Error('invalid_secretary_reply');
+    // An approved private batch can never be redirected to a group, newsletter,
+    // LID, or a model-provided destination. Keep its previewed text unchanged.
+    if (privateOnly && (typeof to !== 'string' || !/^[1-9]\d{7,14}@s\.whatsapp\.net$/.test(to))) {
+      throw new Error('secretary_private_destination_required');
+    }
+    if (groupJid(to)) { await withAbortSignal(() => sendGroup(to, reply, messageId, signal), signal); return; }
+    const number = typeof to === 'string' ? to.replace(/@s\.whatsapp\.net$/, '') : '';
+    if (!/^[1-9]\d{7,14}$/.test(number) || number === config.botNumber || !config.allowedNumbers.has(number)) {
+      throw new Error('secretary_recipient_unavailable');
+    }
+    await withAbortSignal(async () => {
+      const active = await isActiveNumber(number);
+      if (!active || !ready || stopped || current !== socket || signal.aborted ||
+        number === config.botNumber || !config.allowedNumbers.has(number)) throw new Error('secretary_recipient_unavailable');
+      return current.sendMessage(`${number}@s.whatsapp.net`, { text: reply, linkPreview: null }, { messageId });
+    }, signal);
+  }
+
+  async function drainBackground() {
+    const jobs = preferOutbox ? ['outbox', 'reminder'] : ['reminder', 'outbox'];
+    for (const kind of jobs) {
+      if (!ready || stopped) return false;
+      const queue = kind === 'outbox' ? secretaryOutbox : secretaryJobs;
+      if (!queue) continue;
+      let result;
+      try { result = await queue.deliverNext(message => sendScheduled(message, kind === 'outbox')); }
+      catch (error) {
+        if (kind !== 'outbox') throw error;
+        // A broadcast worker failure must not tear down the linked account or OTP.
+        result = { status: 'failed' };
+      }
+      if (result.status !== 'idle') {
+        preferOutbox = kind !== 'outbox';
+        const label = kind === 'outbox' ? 'outbox' : 'delivery';
+        const status = result.status === 'sent' ? 'sent' : result.status === 'uncertain' ? 'uncertain' : 'failed';
+        output.info(`Titanium secretary ${label}: ${status}.`);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async function drainInbox() {
+    if (!ready || stopped) return false;
+    const row = store.next(now());
+    if (!row) return false;
+    await deliverOne(store, row, config, {
+      now, fetcher,
+      authorizeChat: async body => await isActiveNumber(body.senderNumber) &&
+        (body.groupId === null || (await inspectGroup(body.groupId)).allowed),
+      onPrivacyBlocked: privacyRefusal,
+      sendReply: async (jid, text, messageId, body) => {
+        if (!ready || stopped) throw new Error('not_connected');
+        if (!await isActiveNumber(body.senderNumber)) throw new Error('sender_disabled');
+        if (config.allowedGroups.has(jid)) {
+          await sendGroup(jid, text, messageId);
+          return;
+        }
+        await socket.sendMessage(jid, { text, linkPreview: null }, { messageId });
+      },
+    });
+    return true;
+  }
+
   const queueTimer = timers.setInterval(() => {
     if (!ready || stopped || draining) return;
     draining = true;
@@ -203,42 +275,15 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
         socket: { groupFetchAllParticipating: () => withDeadline(() => socket.groupFetchAllParticipating()) },
         config, inspectGroup, sendGroup, now })) return;
       if (config.tasksEnabled === false) return;
-      if (secretaryJobs) {
-        const result = await secretaryJobs.deliverNext(async ({ to, text, messageId, signal }) => {
-          if (!ready || stopped || signal?.aborted || typeof messageId !== 'string' ||
-            !/^[a-zA-Z0-9_-]{1,200}$/.test(messageId)) throw new Error('secretary_delivery_unavailable');
-          const reply = boundedPlainText(text);
-          if (!reply) throw new Error('empty_secretary_reply');
-          if (groupJid(to)) { await withAbortSignal(() => sendGroup(to, reply, messageId, signal), signal); return; }
-          const number = typeof to === 'string' ? to.replace(/@s\.whatsapp\.net$/, '') : '';
-          if (!/^[1-9]\d{7,14}$/.test(number) || number === config.botNumber ||
-            !config.allowedNumbers.has(number) || !await isActiveNumber(number) || signal?.aborted) {
-            throw new Error('secretary_recipient_unavailable');
-          }
-          await withAbortSignal(() => socket.sendMessage(`${number}@s.whatsapp.net`, { text: reply, linkPreview: null }, { messageId }), signal);
-        });
-        if (result.status !== 'idle') {
-          output.info(`Titanium secretary delivery: ${result.status === 'sent' ? 'sent' : 'failed'}.`);
-          return;
-        }
+      // OTP is checked first on every tick. Alternate one inbox item with one
+      // background delivery so either backlog can make progress without a bulk loop.
+      if (preferBackground) {
+        if (await drainBackground()) { preferBackground = false; return; }
+        if (await drainInbox()) preferBackground = true;
+      } else {
+        if (await drainInbox()) { preferBackground = true; return; }
+        if (await drainBackground()) preferBackground = false;
       }
-      const row = store.next(now());
-      if (!row) return;
-      await deliverOne(store, row, config, {
-        now, fetcher,
-        authorizeChat: async body => await isActiveNumber(body.senderNumber) &&
-          (body.groupId === null || (await inspectGroup(body.groupId)).allowed),
-        onPrivacyBlocked: privacyRefusal,
-        sendReply: async (jid, text, messageId, body) => {
-          if (!ready || stopped) throw new Error('not_connected');
-          if (!await isActiveNumber(body.senderNumber)) throw new Error('sender_disabled');
-          if (config.allowedGroups.has(jid)) {
-            await sendGroup(jid, text, messageId);
-            return;
-          }
-          await socket.sendMessage(jid, { text, linkPreview: null }, { messageId });
-        },
-      });
     })().catch(() => stop('queue_failed')).finally(() => { draining = false; });
   }, 1000);
   return { start: startSocket, stop, status: () => ({ ready, stopped, reconnectCount }) };
