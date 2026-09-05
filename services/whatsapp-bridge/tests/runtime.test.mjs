@@ -175,3 +175,40 @@ test('close arriving during asynchronous self-check cannot accidentally re-enabl
   await flush();
   assert.equal(h.runtime.status().ready, false);
 });
+
+test('close diagnostics disclose only numeric status and registered boolean', async t => {
+  const h = harness(t);
+  await h.runtime.start();
+  h.sockets[0].ev.emit('connection.update', { connection: 'close', lastDisconnect: {
+    error: { message: 'SYNTHETIC_SECRET_MESSAGE', data: { token: 'SYNTHETIC_SECRET_TOKEN' }, output: { statusCode: 401 } },
+  } });
+  await flush();
+  assert.ok(h.output.includes('Titanium bridge connection closed: status=401; registered=true.'));
+  assert.doesNotMatch(h.output.join('\n'), /SYNTHETIC_SECRET|token|15551234568/);
+  assert.deepEqual(h.stopped, ['session_requires_owner_attention']);
+});
+
+test('unknown close status never interpolates arbitrary error text or objects', async t => {
+  for (const statusCode of [undefined, 'SYNTHETIC_SECRET_STATUS', { toString() { throw new Error('must not stringify'); } }]) {
+    const h = harness(t, { paired: false, allowPairing: true });
+    await h.runtime.start();
+    h.sockets[0].ev.emit('connection.update', { connection: 'close', lastDisconnect: {
+      error: { message: 'SYNTHETIC_SECRET_MESSAGE', output: { statusCode } },
+    } });
+    await flush();
+    assert.ok(h.output.includes('Titanium bridge connection closed: status=unknown; registered=false.'));
+    assert.doesNotMatch(h.output.join('\n'), /SYNTHETIC_SECRET|must not stringify|15551234568/);
+    assert.deepEqual(h.stopped, []);
+    assert.equal(h.timerJobs.length, 1);
+  }
+});
+
+test('new-login diagnostic is fixed text and does not imply an open connection', async t => {
+  const h = harness(t, { paired: false, allowPairing: true });
+  await h.runtime.start();
+  h.sockets[0].ev.emit('connection.update', { isNewLogin: true, diagnostic: 'SYNTHETIC_SECRET_NEW_LOGIN' });
+  await flush();
+  assert.deepEqual(h.output, ['Titanium bridge pairing accepted; awaiting connection restart.']);
+  assert.equal(h.runtime.status().ready, false);
+  assert.deepEqual(h.stopped, []);
+});

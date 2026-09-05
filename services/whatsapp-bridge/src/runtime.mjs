@@ -62,6 +62,9 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       void (async () => {
         if (stopped || current !== socket) return;
         const epoch = update.connection ? ++connectionEpoch : connectionEpoch;
+        if (update.isNewLogin === true) {
+          output.info('Titanium bridge pairing accepted; awaiting connection restart.');
+        }
         if (update.qr && !auth.state.creds.registered && !pairRequested) {
           if (!config.allowPairing) { stop('pairing_required'); return; }
           pairRequested = true;
@@ -82,6 +85,8 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
         if (update.connection === 'close') {
           ready = false;
           const code = update.lastDisconnect?.error?.output?.statusCode;
+          const safeStatus = Number.isSafeInteger(code) ? code : 'unknown';
+          output.info(`Titanium bridge connection closed: status=${safeStatus}; registered=${auth.state.creds.registered === true}.`);
           if ([DisconnectReason.loggedOut, DisconnectReason.forbidden, DisconnectReason.connectionReplaced,
             DisconnectReason.badSession, DisconnectReason.multideviceMismatch].includes(code)) {
             stop('session_requires_owner_attention'); return;
