@@ -43,6 +43,44 @@ test("private API responses are never cacheable", async () => {
   }
 });
 
+test("only the exact non-www management host redirects, preserving paths and query values", async () => {
+  const require = createRequire(import.meta.url);
+  const source = await readSource("../next.config.ts");
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const { default: config } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
+  const redirects = await config.redirects();
+  assert.equal(redirects.length, 1);
+  const [rule] = redirects;
+  assert.equal(rule.source, "/:path*");
+  assert.equal(rule.permanent, true);
+  const { matchHas, prepareDestination } = require("next/dist/shared/lib/router/utils/prepare-destination.js");
+  const { getPathMatch } = require("next/dist/shared/lib/router/utils/path-match.js");
+  const { getRedirectStatus } = require("next/dist/lib/redirect-status.js");
+  assert.equal(getRedirectStatus(rule), 308);
+  for (const host of ["management.titanium-pharmacy.com", "management.titanium-pharmacy.com:443", "MANAGEMENT.TITANIUM-PHARMACY.COM"]) {
+    assert.ok(matchHas({ headers: { host } }, {}, rule.has));
+  }
+  for (const host of ["www.management.titanium-pharmacy.com", "titanium-pharmacy.com", "cpanel.titanium-pharmacy.com",
+    "managementXtitanium-pharmacyXcom", "management.titanium-pharmacy.com.attacker.test", "other.management.titanium-pharmacy.com", "localhost"]) {
+    assert.equal(matchHas({ headers: { host, "x-forwarded-host": "management.titanium-pharmacy.com" } }, {}, rule.has), false, host);
+  }
+  const query = { project: "project-1", task: "task-2", search: "مهمة باسم", filter: ["open", "progress"] };
+  for (const pathname of ["/", "/privacy", "/api/auth", "/projects/example", "/_next/static/chunks/abc123.js"]) {
+    const params = getPathMatch(rule.source)(pathname);
+    assert.ok(params);
+    const { parsedDestination } = prepareDestination({ destination: rule.destination, params, query, appendParamsToQuery: false });
+    assert.equal(parsedDestination.protocol, "https:");
+    assert.equal(parsedDestination.hostname, "www.management.titanium-pharmacy.com");
+    // Next represents the zero-segment root as an empty URL pathname.
+    assert.equal(parsedDestination.pathname || "/", pathname);
+    assert.deepEqual(parsedDestination.query, query);
+    assert.equal(matchHas({ headers: { host: parsedDestination.hostname } }, query, rule.has), false, "destination must not redirect again");
+  }
+  assert.equal(config.headers, undefined, "hashed asset caching must remain managed by Next");
+});
+
 test("fresh production setup is closed unless explicitly enabled server-side", async () => {
   const source = await readSource("../lib/titanium-server.ts");
   assert.match(source, /TITANIUM_ALLOW_INITIAL_SETUP/);
