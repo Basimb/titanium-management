@@ -6,6 +6,7 @@ import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
 import { directTaskCreationIntent, emptySecretaryIntent, validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
 import { priorityTaskQuery, type PriorityTaskQuery } from "./secretary-priority-query.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
+import { secretaryReviewRequest, isSecretaryIdentityQuery, SECRETARY_IDENTITY } from "./secretary-review.ts";
 import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, secretaryOutboxDeliveryLabel, SecretaryOutboxError } from "./secretary-outbox.ts";
 import { migrateSecretaryChoices, createSecretaryChoices, consumeSecretaryChoice, clearSecretaryChoices, secretaryChoiceOptions, SecretaryChoiceError, type SecretaryChoices, type SecretaryChoiceField } from "./secretary-choices.ts";
 
@@ -51,9 +52,12 @@ function actorFor(db: DatabaseSync, event: Event, config: TeamChatConfig) {
 function stateFor(db: DatabaseSync, actor: ChatUser): Snapshot { return getManagementSnapshot(db, actor) as unknown as Snapshot; }
 function fingerprint(state: Snapshot) { return hash({ tasks: state.tasks, projects: state.projects, users: state.users.map(u => ({ id: u.id, name: u.name, role: u.role, active: u.active })), comments: state.comments }); }
 function scopeAllowed(scope: string[], state: Snapshot) { const ids = new Set([...state.tasks.map(t => "t:" + t.id), ...state.projects.map(p => "p:" + p.id)]); return scope.every(id => ids.has(id)); }
-function conversationHistory(db: DatabaseSync, key: string, state: Snapshot, now: number): HistoryRow[] {
-  const rows = db.prepare("SELECT original_text,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND created_at>? ORDER BY created_at DESC,rowid DESC LIMIT 8")
-    .all(key, now - HISTORY_MS) as HistoryRow[];
+function conversationHistory(db: DatabaseSync, key: string, state: Snapshot, now: number, anchor?: { created_at: number; sequence: number }): HistoryRow[] {
+  const rows = (anchor
+    ? db.prepare("SELECT original_text,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND created_at>? AND (created_at<? OR (created_at=? AND rowid<=?)) ORDER BY created_at DESC,rowid DESC LIMIT 8")
+      .all(key, now - HISTORY_MS, anchor.created_at, anchor.created_at, anchor.sequence)
+    : db.prepare("SELECT original_text,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND created_at>? ORDER BY created_at DESC,rowid DESC LIMIT 8")
+      .all(key, now - HISTORY_MS)) as HistoryRow[];
   // Never let an inaccessible event supply either model context or task focus.
   return rows.reverse().filter(row => scopeAllowed(JSON.parse(row.scope_json), state));
 }
@@ -143,7 +147,7 @@ function priorityReadReply(query: Extract<PriorityTaskQuery, { kind: "query" }>,
 }
 function readReply(plan: SecretaryIntent, actor: ChatUser, state: Snapshot, now: number): { result: Result; scope: string[] } {
   const greeting = `أهلًا يا ${clean(actor.name, 60)}، `;
-  if (plan.kind === "help") return { result: { status: "summary", reply: `${greeting}أنا سكرتير فريق إدارة تيتانيوم.\nاحكيلي بطريقتك: شو مهامي؟ اشرح المهمة، سجل تحديث، أو افتح مشروعًا (لباسم). رح أستوضح أي غموض وأطلب تأكيدًا قبل التغييرات الحساسة.\nالدخول للموقع برمز خاص على واتسابك المسجّل:\n${ORIGIN}/` }, scope: [] };
+  if (plan.kind === "help") return { result: { status: "summary", reply: `${greeting}${SECRETARY_IDENTITY}\nاحكيلي بطريقتك: شو مهامي؟ اشرح المهمة، سجل تحديث، أو افتح مشروعًا (لباسم). وإذا قلت «جوابك غلط» براجع السؤال وجوابي على ضوء المعلومات المتاحة، وبستوضح أي نقص.\nالدخول للموقع برمز خاص على واتسابك المسجّل:\n${ORIGIN}/` }, scope: [] };
   if (plan.kind === "projects") return { result: { status: "summary", reply: greeting + (state.projects.length ? state.projects.slice(0, 16).map(p => `• *${clean(p.name, 100)}* — ${LABELS[p.status] || clean(p.status)}\n${ORIGIN}/?project=${encodeURIComponent(p.id)}`).join("\n\n") : "ما في مشاريع متاحة إلك حاليًا.") }, scope: state.projects.map(p => "p:" + p.id) };
   if (plan.kind === "details") {
     const task = state.tasks.find(t => t.id === plan.taskId);
@@ -334,6 +338,17 @@ function reminder(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapsh
   return save(db, event, actor, { status: "scheduled", reply: `جدولت تذكيرك عن «${clean(task.title)}» يوم ${new Intl.DateTimeFormat("ar-JO", { timeZone: "Asia/Amman", dateStyle: "medium", timeStyle: "short" }).format(due)} في نفس المحادثة.`, taskId: task.id }, ["t:" + task.id], now);
 }
 
+// Search only an exact user-authored question, never model-extracted history or a
+// task catalog. Private/project questions are answered through authorized DB reads.
+function privateSearchQuestion(query: string, state: Snapshot): boolean {
+  const normalize = (value: string) => value.normalize("NFKC").replace(/[\u064b-\u065f\u0670\u0640]/g, "").replace(/[أإآ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه").toLowerCase();
+  const value = normalize(query);
+  return !query.trim() || query.length > 500 || (value.match(/[0-9٠-٩۰-۹]/gu)?.length ?? 0) >= 6
+    || /@|https?:\/\/|(?:مهمتي|مهامي|مشاريعي|مشروعنا|موظف|مريض|رقم الهويه|رمز الدخول|كلمه السر|ارقام الفريق|ارقام فريق|ارقام الشباب|فريقنا|شركتنا|راتب|رواتب)|\b(?:otp|password|pin|api.?key)\b/u.test(value)
+    || [...state.tasks.map(t => t.title), ...state.projects.map(p => p.name), ...state.users.map(u => u.name)]
+      .some(title => title.length > 2 && value.includes(normalize(title)));
+}
+
 export async function handleSecretaryEvent(db: DatabaseSync, event: Event, config: TeamChatConfig, dependencies: {
   infer: (input: SecretaryModelInput) => Promise<SecretaryIntent>; search?: (query: string) => Promise<string>; now?: () => number;
 }): Promise<Result> {
@@ -367,12 +382,30 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
       return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now);
     }
   });
-  const quote = event.replyToMessageId ? db.prepare("SELECT event_key,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND response_message_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(key, event.replyToMessageId) as { event_key: string; result_json: string; scope_json: string } | undefined : undefined;
+  const quote = event.replyToMessageId ? db.prepare("SELECT event_key,original_text,result_json,scope_json,created_at,rowid AS sequence FROM secretary_events WHERE conversation_key=? AND response_message_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(key, event.replyToMessageId) as { event_key: string; original_text: string; result_json: string; scope_json: string; created_at: number; sequence: number } | undefined : undefined;
   if (event.replyToMessageId && (!quote || !scopeAllowed(JSON.parse(quote.scope_json), initial))) return transaction(db, () => save(db, event, actor, { status: "clarify", reply: "ما قدرت أربط هذا الرد بطلب متاح إلك. اذكر المهمة والتغيير المطلوب بدل الرد على رسالة قديمة أو لشخص آخر." }, [], now));
   const historyRows = conversationHistory(db, key, initial, now);
   const focusResult = quote ? JSON.parse(quote.result_json) : historyRows.length ? JSON.parse(historyRows[historyRows.length - 1].result_json) : null;
   const focusedTask = initial.tasks.find(task => task.id === focusResult?.taskId);
   const focusedTaskId = focusedTask?.id ?? null;
+  const history = boundedHistory(historyRows, quote);
+  // A reply to an earlier review must recover that review's original question,
+  // never a newer unrelated question after the quoted event.
+  const reviewingReview = quote && secretaryReviewRequest(quote.original_text, []) !== null;
+  const reviewRequest = reviewingReview
+    ? secretaryReviewRequest(event.text, boundedHistory(conversationHistory(db, key, initial, now, quote)))
+    : secretaryReviewRequest(event.text, history, quote ? { question: quote.original_text, previousAnswer: String(JSON.parse(quote.result_json).reply) } : undefined);
+  const earlyRead = (result: Result) => transaction(db, () => {
+    const freshActor = actorFor(db, event, config);
+    if (!config.enabled || !freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
+    const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
+    if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل؛ خلينا نراجع آخر وضع." }, [], now);
+    rememberPendingPreview(db, event, key, db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined);
+    return save(db, event, freshActor, result, [], now);
+  });
+  if (isSecretaryIdentityQuery(event.text)) return earlyRead({ status: "summary", reply: SECRETARY_IDENTITY });
+  if (reviewRequest?.kind === "clarify") return earlyRead({ status: "clarify", reply: reviewRequest.reply });
+  const review = reviewRequest?.kind === "review" ? reviewRequest : null;
   if (storedIntake && isCancellation(event.text)) return transaction(db, () => {
     const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
     const duplicate = lookup(db, event, freshActor, stateFor(db, freshActor)); if (duplicate) return duplicate;
@@ -440,26 +473,42 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
       return perform(db, event, freshActor, state, command, now, { originalText: live.original_text, sourceMessageId: live.source_message_id, confirmationRequired: true, confirmedBy: freshActor.id, confirmationMessageId: event.messageId });
     });
   }
-  const history = boundedHistory(historyRows, quote);
   const canMessageTeam = actor.id === "basem" && actor.role === "admin" && event.groupId === null;
   const pendingCommand = canMessageTeam && pending && pending.expires_at > now ? JSON.parse(pending.command_json) : null;
-  const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId, taskDraft,
+  const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId, taskDraft: review ? null : taskDraft,
+    ...(review ? { review: { previousQuestion: review.question, previousAnswer: review.previousAnswer } } : {}),
     canMessageTeam, messageRecipients: canMessageTeam ? getSecretaryOutboxRecipients(db, config).map(user => ({ id: user.userId, name: user.name })) : [],
     pendingMessagePreview: pendingCommand?.action === "message_team" && typeof pendingCommand.text === "string" && Array.isArray(pendingCommand.recipientIds) ? { text: pendingCommand.text, recipientIds: pendingCommand.recipientIds } : null,
     tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status, priority: t.priority })),
     projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString() };
-  const directCreation = event.inputKind !== "voice" && !event.replyToMessageId ? directTaskCreationIntent(input) : null;
+  const directCreation = !review && event.inputKind !== "voice" && !event.replyToMessageId ? directTaskCreationIntent(input) : null;
   // A bare color can answer an active creation question; explicit list requests switch topic.
-  const priorityQuery = !event.replyToMessageId && (!taskDraft || /مهام|اعط|أعط|وريني|اعرض|اسرد/u.test(event.text)) ? priorityTaskQuery(event.text, input) : null;
-  const plan = priorityQuery ? emptySecretaryIntent(priorityQuery.kind === "clarify" ? "clarify" : "summary", priorityQuery.kind === "clarify" ? priorityQuery.reply : null)
-    : directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
+  const readQuestion = review?.question || event.text;
+  const priorityQuery = review ? priorityTaskQuery(readQuestion, input)
+    : !event.replyToMessageId && (!taskDraft || /مهام|اعط|أعط|وريني|اعرض|اسرد/u.test(event.text)) ? priorityTaskQuery(event.text, input) : null;
+  let plan: SecretaryIntent;
+  try {
+    plan = priorityQuery ? emptySecretaryIntent(priorityQuery.kind === "clarify" ? "clarify" : "summary", priorityQuery.kind === "clarify" ? priorityQuery.reply : null)
+      : directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
+  } catch (error) {
+    if (!review) throw error;
+    plan = emptySecretaryIntent("clarify", "ما قدرت أكمل مراجعة الجواب الآن، وما بدي أخمّن أو أكرر نتيجة غير مؤكدة. حدد النقطة المختلف عليها لنراجعها؛ لم أنفّذ أي تغيير.");
+  }
+  // Independent of the provider validator: criticism never grants a write/replay.
+  if (review && !["summary", "details", "projects", "report", "help", "chat", "clarify", "search", "message_status"].includes(plan.kind)) {
+    plan = emptySecretaryIntent("clarify", "براجع الجواب معك؛ لم أنفّذ أو أعد إرسال أي طلب. اكتب التغيير المطلوب كطلب جديد إذا بدك تنفيذه.");
+  }
   let publicReply: string | null = null;
   if (plan.kind === "search") {
-    // Require query to be newly supplied, not copied from internal catalog/history by the model.
-    const query = event.text.trim(); // Never send model-invented fragments copied from an internal catalog.
-    const leaked = query.length > 500 || /\d{6,}|@|(?:مهامي|مشاريعي|موظف|مريض|رقم الهوية|رمز الدخول|كلمة السر)/u.test(query)
-      || [...initial.tasks.map(t => t.title), ...initial.projects.map(p => p.name), ...initial.users.map(u => u.name)].some(title => title.length > 2 && query.includes(title));
-    publicReply = leaked ? "لن أرسل بيانات المشاريع إلى محرك بحث عام. اكتب سؤالك العام بدون معلومات داخلية." : dependencies.search ? await dependencies.search(query) : "البحث العام غير مفعّل حاليًا. أقدر أساعدك بمعلومات الموقع.";
+    const query = readQuestion.trim(); // Exact current/prior user question, not plan.message.
+    if (privateSearchQuestion(query, initial)) publicReply = "هذا السؤال قد يتضمن معلومات داخلية؛ ما أرسلته لبحث عام. حدد المهمة أو المعلومة العامة المطلوبة بدون بيانات خاصة.";
+    else if (!dependencies.search) publicReply = "البحث العام غير مفعّل حاليًا؛ ما عملت بحثًا. أقدر أراجع بيانات الموقع أو أوضح ما يلزم للتحقق.";
+    else try { publicReply = await dependencies.search(query); }
+    catch (error) {
+      if (!review) throw error;
+      publicReply = "حاولت البحث للتحقق من السؤال السابق، لكن البحث تعذّر؛ ما عندي مصدر أؤكد منه التصحيح الآن. لم أنفّذ أي تغيير.";
+      plan = emptySecretaryIntent("clarify", publicReply);
+    }
   }
   return transaction(db, () => {
     const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
@@ -470,11 +519,13 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     rememberPendingPreview(db, event, key, db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined);
     if (plan.kind === "task_draft") return taskIntake(db, event, freshActor, state, plan, key, taskDraft, now);
     // Only an explicit task_draft plan may continue intake; unrelated subjects cannot revive it later.
-    if (storedIntake) db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
-    if (pendingDraft) db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
-    clearSecretaryChoices(db, key);
+    if (!review) {
+      if (storedIntake) db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
+      if (pendingDraft) db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+      clearSecretaryChoices(db, key);
+    }
     if (priorityQuery?.kind === "query") {
-      const read = priorityReadReply(priorityQuery, state, now, event.text);
+      const read = priorityReadReply(priorityQuery, state, now, readQuestion);
       return save(db, event, freshActor, read.result, read.scope, now);
     }
     if (plan.kind === "message_status") {
