@@ -159,7 +159,8 @@ test('bare approval without a pending request cannot become a model-generated ac
  const f=fixture(t);
  for(const text of ['نعم','موافق','تمام','موافق T123ABC']) {
    const result=await f.run(command('comment',{body:'must not be written'}),{text},async()=>{throw Error('do not infer approval');});
-   assert.equal(result.status,'clarify');
+   assert.equal(result.status,text.includes('T123ABC')?'clarify':'summary');
+   if(!text.includes('T123ABC')) { assert.match(result.reply,/أنا معك/);assert.doesNotMatch(result.reply,/ما في طلب|تم التنفيذ/); }
  }
  assert.equal(f.db.prepare('SELECT count(*) n FROM comments').get().n,0);
 });
@@ -183,4 +184,78 @@ test('ambiguous project creation produces clarification and never inserts into a
  assert.equal(pending(f.db),undefined);
  assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى p2'})).status,'applied');
  assert.equal(f.db.prepare("SELECT project_id FROM tasks WHERE title='تقرير جديد'").get().project_id,'p2');
+});
+
+test('history retains the latest eight exchanges within 24 hours in deterministic insertion order',async t=>{
+ const f=fixture(t);
+ await f.run(emptySecretaryIntent('chat','جواب قديم'),{text:'حديث منذ يوم'});
+ f.tick(24*60*60_000);
+ await f.run(emptySecretaryIntent('help'),{text:'اختبار الحد'},async input=>{assert.equal(input.history.length,0);return emptySecretaryIntent('help');});
+ for(let i=0;i<10;i++) await f.run(emptySecretaryIntent('chat',`جواب ${i}`),{text:`حديث ${i}`});
+ f.tick(60*60_000);
+ await f.run(undefined,{},async input=>{
+   assert.deepEqual(input.history.filter(item=>item.role==='user').map(item=>item.content),Array.from({length:8},(_,i)=>`حديث ${i+2}`));
+   assert.deepEqual(input.history.filter(item=>item.role==='assistant').map(item=>item.content),Array.from({length:8},(_,i)=>`جواب ${i+2}`));
+   return emptySecretaryIntent('help');
+ });
+});
+
+test('history and quoted context share a 6000-character budget without changing role isolation',async t=>{
+ const f=fixture(t);
+ for(let i=0;i<8;i++) await f.run(emptySecretaryIntent('chat',`جواب ${i} ${'س'.repeat(1300)}`),{text:`حديث ${i} ${'ن'.repeat(1800)}`,responseMessageId:`LONG-${i}`});
+ await f.run(undefined,{text:'وضح الكلام',replyToMessageId:'LONG-7'},async input=>{
+   assert.ok(input.history.length<=17);
+   assert.ok(input.history.reduce((sum,item)=>sum+item.content.length,0)<=6000);
+   assert.ok(input.history.every(item=>['user','assistant'].includes(item.role)));
+   assert.match(input.history[input.history.length-1].content,/الرسالة التي يرد عليها/);
+   assert.ok(input.history.some(item=>item.content.startsWith('حديث 7')));
+   return emptySecretaryIntent('help');
+ });
+});
+
+test('contextual chat and friendly acknowledgment retain focus but a new topic clears it',async t=>{
+ const f=fixture(t);const details={...emptySecretaryIntent('details'),taskId:'t'};
+ await f.run(details,{text:'اشرح اللوحة'});
+ const chat={...emptySecretaryIntent('chat','المقصود تجهيز اللوحة ومتابعة المورد.'),taskId:'t'};
+ await f.run(chat,{text:'شو يعني؟'},async input=>{assert.equal(input.focusedTaskId,'t');return chat;});
+ const ack=await f.run(undefined,{text:'تمام'},async()=>{throw Error('friendly acknowledgment must not invoke model');});
+ assert.equal(ack.status,'summary');assert.equal(ack.taskId,'t');assert.match(ack.reply,/لوحة/);
+ await f.run(undefined,{text:'شو أحسن طريقة أرتب يومي؟'},async input=>{assert.equal(input.focusedTaskId,'t');return emptySecretaryIntent('chat','ابدأ بتحديد أولويات يومك.');});
+ await f.run(undefined,{text:'اشرح أكثر'},async input=>{assert.equal(input.focusedTaskId,null);return emptySecretaryIntent('chat','قسّم وقتك إلى فترات قصيرة.');});
+ assert.equal(f.db.prepare('SELECT count(*) n FROM comments').get().n,0);
+ assert.equal(f.db.prepare("SELECT status FROM tasks WHERE id='t'").get().status,'progress');
+});
+
+test('inaccessible history cannot supply focus even when its result points to a still-visible task',async t=>{
+ const f=fixture(t);
+ f.db.exec("UPDATE tasks SET owner='خالد',suggested_owner='خالد' WHERE id='private'");
+ await f.run({...emptySecretaryIntent('chat','كلام سياقي عن المهمة'),taskId:'t'});
+ f.db.exec("UPDATE tasks SET owner='شادي',suggested_owner='شادي' WHERE id='private'");
+ await f.run(undefined,{},async input=>{assert.equal(input.history.length,0);assert.equal(input.focusedTaskId,null);return emptySecretaryIntent('help');});
+});
+
+test('clarifying questions preserve the exact pending proposal and still need token or matching quote',async t=>{
+ const f=fixture(t);await f.run(command('submit'),{text:'خلصت اللوحة بالكامل',responseMessageId:'PENDING-SUBMIT'});
+ const before={...pending(f.db)};
+ await f.run({...emptySecretaryIntent('chat','المهمة تذهب إلى باسم للمراجعة ولا تصبح معتمدة تلقائيًا.'),taskId:'t'},{text:'شو يعني بانتظار الاعتماد؟'});
+ assert.deepEqual({...pending(f.db)},before);
+ await f.run({...emptySecretaryIntent('clarify','بدك أوضح خطوة المراجعة؟'),taskId:'t'},{text:'وضح أكثر'});
+ assert.deepEqual({...pending(f.db)},before);
+ assert.equal((await f.run(undefined,{text:'نعم'})).status,'clarify');
+ assert.equal(f.db.prepare("SELECT status FROM tasks WHERE id='t'").get().status,'progress');
+ assert.equal(pending(f.db).token,before.token);
+ assert.equal((await f.run(undefined,{text:`موافق ${before.token}`})).status,'applied');
+ assert.equal(f.db.prepare("SELECT status FROM tasks WHERE id='t'").get().status,'approval');
+});
+
+test('conversational replies preserve negation and drafts but suppress clear invented execution',async t=>{
+ const f=fixture(t);
+ for(const reply of ['ما غيّرت المهمة.','هل أضفت المهمة؟','صياغة مقترحة: «أضفت المهمة».']) {
+   assert.equal((await f.run(emptySecretaryIntent('chat',reply),{text:'وضحلي'})).reply,reply);
+ }
+ assert.match((await f.run(emptySecretaryIntent('chat','أضفت المهمة الجديدة للمشروع.'),{text:'مرحبا'})).reply,/ما نفّذت أي تغيير/);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM comments').get().n,0);
+ assert.equal((await f.run(command('delete_task'),{senderNumber:'12025550103',text:'كيف أحذف اللوحة؟'})).status,'clarify');
+ assert.equal(pending(f.db),undefined);
 });

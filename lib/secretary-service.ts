@@ -4,6 +4,7 @@ import { executeManagementAction, getManagementSnapshot, migrateManagementAction
 import { resolveChatUser, normalizeContactNumber, type ChatUser } from "./team-chat-policy.ts";
 import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
 import { validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
+import { safeConversationalReply } from "./secretary-conversation-policy.ts";
 
 type Task = { id: string; projectId: string; title: string; details: string; status: string; priority: string; owner: string | null; suggestedOwner: string | null; dueDate: string | null; updatedAt: number | null; archivedAt: number | null };
 type Project = { id: string; name: string; status: string; updatedAt?: number | null; archivedAt?: number | null };
@@ -11,8 +12,11 @@ type Snapshot = { tasks: Task[]; projects: Project[]; users: Array<ChatUser>; co
 type Event = TeamChatEnvelope & { replyToMessageId?: string | null; responseMessageId?: string | null };
 type Result = { status: string; reply: string; taskId?: string };
 type Pending = { token: string; command_json: string; snapshot_hash: string; original_text: string; source_message_id: string; expires_at: number };
+type HistoryRow = { original_text: string; result_json: string; scope_json: string };
 const ORIGIN = "https://www.management.titanium-pharmacy.com";
 const CONFIRM_MS = 10 * 60_000;
+const HISTORY_MS = 24 * 60 * 60_000;
+const HISTORY_CHARS = 6000;
 const SENSITIVE = new Set(["edit_project", "approve_project", "reject_project", "restore_project", "archive_project", "delete_project", "edit_task", "cancel_claim", "submit", "approve", "reject", "reopen", "reassign", "move_task", "archive_task", "restore_task", "delete_task"]);
 const LABELS: Record<string, string> = { open: "بانتظار الاستلام", progress: "قيد التنفيذ", approval: "بانتظار اعتماد باسم", completed: "معتمدة", active: "نشط", pending: "بانتظار الموافقة", rejected: "مرفوض" };
 const ACTION_LABELS: Record<string, string> = { add_project: "إنشاء مشروع", edit_project: "تعديل المشروع", approve_project: "اعتماد المشروع", reject_project: "رفض المشروع", restore_project: "إعادة فتح المشروع", archive_project: "أرشفة المشروع", delete_project: "حذف المشروع نهائيًا", add_task: "إنشاء مهمة", edit_task: "تعديل المهمة", claim: "استلام المهمة", cancel_claim: "إرجاع المهمة", comment: "إضافة تعليق", submit: "إرسال المهمة لاعتماد باسم", approve: "اعتماد إنجاز المهمة", reject: "رفض الإنجاز", reopen: "إعادة فتح المهمة", reassign: "تغيير المسؤول", move_task: "نقل المهمة", archive_task: "أرشفة المهمة", restore_task: "استعادة المهمة", delete_task: "حذف المهمة نهائيًا" };
@@ -36,6 +40,27 @@ function actorFor(db: DatabaseSync, event: Event, config: TeamChatConfig) {
 function stateFor(db: DatabaseSync, actor: ChatUser): Snapshot { return getManagementSnapshot(db, actor) as unknown as Snapshot; }
 function fingerprint(state: Snapshot) { return hash({ tasks: state.tasks, projects: state.projects, users: state.users.map(u => ({ id: u.id, name: u.name, role: u.role, active: u.active })), comments: state.comments }); }
 function scopeAllowed(scope: string[], state: Snapshot) { const ids = new Set([...state.tasks.map(t => "t:" + t.id), ...state.projects.map(p => "p:" + p.id)]); return scope.every(id => ids.has(id)); }
+function conversationHistory(db: DatabaseSync, key: string, state: Snapshot, now: number): HistoryRow[] {
+  const rows = db.prepare("SELECT original_text,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND created_at>? ORDER BY created_at DESC,rowid DESC LIMIT 8")
+    .all(key, now - HISTORY_MS) as HistoryRow[];
+  // Never let an inaccessible event supply either model context or task focus.
+  return rows.reverse().filter(row => scopeAllowed(JSON.parse(row.scope_json), state));
+}
+function boundedHistory(rows: HistoryRow[], quote?: { result_json: string }): SecretaryModelInput["history"] {
+  const quoted = quote ? ("الرسالة التي يرد عليها المستخدم الآن: " + String(JSON.parse(quote.result_json).reply)).slice(0, 900) : "";
+  let remaining = HISTORY_CHARS - quoted.length;
+  const history: SecretaryModelInput["history"] = [];
+  // Preserve complete recent pairs first; older pairs are shortened to the remaining budget.
+  for (const row of [...rows].reverse()) {
+    if (remaining < 2) break;
+    const user = row.original_text.slice(0, Math.min(600, Math.floor(remaining / 2)));
+    const assistant = String(JSON.parse(row.result_json).reply).slice(0, Math.min(900, remaining - user.length));
+    history.unshift({ role: "user", content: user }, { role: "assistant", content: assistant });
+    remaining -= user.length + assistant.length;
+  }
+  if (quoted) history.push({ role: "assistant", content: quoted });
+  return history;
+}
 function lookup(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapshot): Result | null {
   const row = db.prepare("SELECT payload_hash,actor_id,result_json,scope_json FROM secretary_events WHERE event_key=?").get(eventKey(event)) as { payload_hash: string; actor_id: string; result_json: string; scope_json: string } | undefined;
   if (!row) return null;
@@ -130,9 +155,20 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const initial = stateFor(db, actor); const previous = lookup(db, event, actor, initial); if (previous) return previous;
   const key = conversation(event, actor); const initialHash = fingerprint(initial);
   const pending = db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined;
-  const quote = event.replyToMessageId ? db.prepare("SELECT event_key,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND response_message_id=? ORDER BY created_at DESC LIMIT 1").get(key, event.replyToMessageId) as { event_key: string; result_json: string; scope_json: string } | undefined : undefined;
+  const quote = event.replyToMessageId ? db.prepare("SELECT event_key,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND response_message_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(key, event.replyToMessageId) as { event_key: string; result_json: string; scope_json: string } | undefined : undefined;
   if (event.replyToMessageId && (!quote || !scopeAllowed(JSON.parse(quote.scope_json), initial))) return transaction(db, () => save(db, event, actor, { status: "clarify", reply: "ما قدرت أربط هذا الرد بطلب متاح إلك. اذكر المهمة والتغيير المطلوب بدل الرد على رسالة قديمة أو لشخص آخر." }, [], now));
-  if (!pending && isConfirmationAttempt(event.text)) return transaction(db, () => save(db, event, actor, { status: "clarify", reply: "ما في طلب معلّق مطابق للتأكيد. اذكر التغيير المطلوب لأعرضه عليك من جديد." }, [], now));
+  const historyRows = conversationHistory(db, key, initial, now);
+  const focusResult = quote ? JSON.parse(quote.result_json) : historyRows.length ? JSON.parse(historyRows[historyRows.length - 1].result_json) : null;
+  const focusedTask = initial.tasks.find(task => task.id === focusResult?.taskId);
+  const focusedTaskId = focusedTask?.id ?? null;
+  if (!pending && isConfirmationAttempt(event.text)) return transaction(db, () => {
+    const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
+    const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
+    const focusSource = quote ?? historyRows[historyRows.length - 1];
+    const visibleFocus = focusSource && scopeAllowed(JSON.parse(focusSource.scope_json), state) ? state.tasks.find(task => task.id === focusedTaskId) : undefined;
+    if (!AFFIRMATIONS.includes(confirmationText(event.text))) return save(db, event, actor, { status: "clarify", reply: "ما في طلب معلّق مطابق للتأكيد. اذكر التغيير المطلوب لأعرضه عليك من جديد." }, [], now);
+    return save(db, event, freshActor, { status: "summary", reply: `تمام يا ${clean(freshActor.name, 60)}، أنا معك.${visibleFocus ? ` نكمل على «${clean(visibleFocus.title, 120)}»؛ احكيلي شو المطلوب.` : " احكيلي كيف أقدر أساعدك."}`, ...(visibleFocus ? { taskId: visibleFocus.id } : {}) }, visibleFocus ? ["t:" + visibleFocus.id, "p:" + visibleFocus.projectId] : [], now);
+  });
   if (pending && (isConfirmationAttempt(event.text) || isCancellation(event.text))) {
     return transaction(db, () => {
       const freshActor = actorFor(db, event, config); if (!freshActor) return { status: "denied", reply: "" };
@@ -150,11 +186,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
       return perform(db, event, freshActor, state, command, now, { originalText: live.original_text, sourceMessageId: live.source_message_id, confirmationRequired: true, confirmedBy: freshActor.id, confirmationMessageId: event.messageId });
     });
   }
-  const historyRows = db.prepare("SELECT original_text,result_json,scope_json FROM secretary_events WHERE conversation_key=? AND created_at>? ORDER BY created_at DESC LIMIT 4").all(key, now - 30 * 60_000) as Array<{ original_text: string; result_json: string; scope_json: string }>;
-  const history = historyRows.reverse().filter(row => scopeAllowed(JSON.parse(row.scope_json), initial)).flatMap(row => [{ role: "user" as const, content: row.original_text.slice(0, 600) }, { role: "assistant" as const, content: String(JSON.parse(row.result_json).reply).slice(0, 600) }]);
-  if (quote) history.push({ role: "assistant", content: "الرسالة التي يرد عليها المستخدم الآن: " + String(JSON.parse(quote.result_json).reply).slice(0, 900) });
-  const focusResult = quote ? JSON.parse(quote.result_json) : historyRows.length ? JSON.parse(historyRows[historyRows.length - 1].result_json) : null;
-  const focusedTaskId = initial.tasks.some(task => task.id === focusResult?.taskId) ? String(focusResult.taskId) : null;
+  const history = boundedHistory(historyRows, quote);
   const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId,
     tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status })),
     projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString() };
@@ -171,7 +203,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     const freshActor = actorFor(db, event, config); if (!freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
     const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
     if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل أثناء قراءة رسالتك. ما عدّلتها؛ أعد الطلب لأراجع آخر وضع." }, [], now);
-    db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+    if (plan.kind === "command" || plan.kind === "remind") db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
     if (plan.kind === "command") {
       const command = commandFrom(plan, state);
       if (freshActor.id !== "basem" && !["claim", "cancel_claim", "comment", "submit"].includes(String(command.action))) return save(db, event, freshActor, { status: "denied", reply: "هذا القرار من صلاحيات باسم. أقدر أساعدك بتحديث مهامك أو إرسالها للمراجعة." }, [], now);
@@ -196,8 +228,10 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     }
     if (plan.kind === "chat" || plan.kind === "clarify" || plan.kind === "search") {
       let reply = publicReply || plan.message || "أي مهمة أو مشروع تقصد، وشو المطلوب؟";
-      if ((plan.kind === "chat" || plan.kind === "clarify") && /(?:تم |سجلت|سجّلت|أنشأت|حذفت|اعتمدت|غيرت|غيّرت|أرسلت|ذكّرت|نجح)/u.test(reply)) reply = `أهلًا يا ${clean(actor.name)}، احكيلي شو بدك أساعدك فيه. أي تعديل على المهام بيمر بصلاحيات الموقع والتأكيد عند الحاجة.`;
-      return save(db, event, freshActor, { status: plan.kind === "clarify" ? "clarify" : "summary", reply }, plan.kind !== "search" ? [...state.tasks.map(t => "t:" + t.id), ...state.projects.map(p => "p:" + p.id)] : [], now);
+      if (plan.kind === "chat" || plan.kind === "clarify") reply = safeConversationalReply(reply);
+      // The planner explicitly identifies contextual replies; an unrelated topic has no focus.
+      const contextTaskId = plan.kind !== "search" && state.tasks.some(task => task.id === plan.taskId) ? plan.taskId : null;
+      return save(db, event, freshActor, { status: plan.kind === "clarify" ? "clarify" : "summary", reply, ...(contextTaskId ? { taskId: contextTaskId } : {}) }, plan.kind !== "search" ? [...state.tasks.map(t => "t:" + t.id), ...state.projects.map(p => "p:" + p.id)] : [], now);
     }
     const read = readReply(plan, freshActor, state, now); return save(db, event, freshActor, read.result, read.scope, now);
   });
