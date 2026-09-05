@@ -11,6 +11,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { WhatsAppLogin } from "@/components/whatsapp-login";
 import type { WhatsAppLoginSuccess } from "@/components/whatsapp-login-helpers";
+import { SecretaryActivity } from "@/components/secretary-activity";
+import { SecretaryLinkButton } from "@/components/secretary-link-button";
+import { createSecretaryLink, resolveSecretaryDeepLink, secretaryActivityTarget, type SecretaryTarget } from "@/components/secretary-ui-helpers";
 
 type Project = { id:string; name:string; status:string; createdBy:string; createdAt:number; rejectionReason:string|null; rejectedBy:string|null; rejectedAt:number|null };
 type Task = { id:string; projectId:string; title:string; details:string; priority:string; status:string; owner:string|null; suggestedOwner:string|null; startedAt:number|null; dueDate:string|null; completedAt:number|null; rejectionReason:string|null; createdAt:number; updatedAt:number|null; archivedAt:number|null; archivedBy:string|null };
@@ -66,6 +69,15 @@ export default function Dashboard() {
   const [newPin, setNewPin] = useState("");
   const [now, setNow] = useState(() => Date.now());
   const sessionTokenRef = useRef("");
+  const [locationSearch, setLocationSearch] = useState<string|null>(null);
+  const [navigationRevision, setNavigationRevision] = useState(0);
+  const [linkedTarget, setLinkedTarget] = useState<SecretaryTarget|null>(null);
+  const [deepLinkNotice, setDeepLinkNotice] = useState("");
+  const loadedStateOwnerRef = useRef<string|null>(null);
+  const handledDeepLinkRef = useRef("");
+  const pendingDeepLinkFocus = useRef(false);
+  const taskElementsRef = useRef(new Map<string, HTMLElement>());
+  const projectHeadingRef = useRef<HTMLHeadingElement>(null);
 
   const currentUser = data.currentUser;
   const isAdmin = currentUser?.id === "basem" && currentUser.role === "admin";
@@ -106,6 +118,7 @@ export default function Dashboard() {
       if (response.status === 401) { setData(emptyState); return; }
       throw new Error(next.error || "تعذر تحميل البيانات");
     }
+    loadedStateOwnerRef.current = next.currentUser?.id ?? null;
     setData(next);
     setActiveProject(current => current && next.projects.some((project:Project) => project.id === current) ? current : next.projects.find((project:Project) => project.status === "active")?.id || "");
   }
@@ -169,6 +182,62 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 60000); return () => window.clearInterval(timer); }, []);
+  useEffect(() => {
+    const changed = () => { setLocationSearch(window.location.search); setNavigationRevision(value => value + 1); };
+    changed();
+    window.addEventListener("popstate", changed);
+    return () => window.removeEventListener("popstate", changed);
+  }, []);
+  useEffect(() => {
+    if (!currentUser) {
+      loadedStateOwnerRef.current = null;
+      handledDeepLinkRef.current = "";
+      pendingDeepLinkFocus.current = false;
+      setLinkedTarget(null); setDeepLinkNotice("");
+      return;
+    }
+    // Restoring an authenticated user is not enough: wait for that user's actual
+    // authorized state response before resolving IDs from the address bar.
+    if (loading || locationSearch === null || loadedStateOwnerRef.current !== currentUser.id) return;
+    const key = JSON.stringify([currentUser.id, locationSearch, navigationRevision]);
+    if (handledDeepLinkRef.current === key) return;
+    handledDeepLinkRef.current = key;
+    const result = resolveSecretaryDeepLink(locationSearch, currentUser, data.projects, data.tasks);
+    if (result.status === "resolved") {
+      setActiveProject(result.target.projectId);
+      setSearch(""); setOwnerFilter("all"); setPriorityFilter("all");
+      setStatusFilter(result.archived ? "archived" : "all");
+      if (result.target.taskId) setExpandedComments(current => ({ ...current, [result.target.taskId!]: true }));
+      pendingDeepLinkFocus.current = true;
+      setLinkedTarget(result.target); setDeepLinkNotice(result.announcement);
+    } else {
+      setLinkedTarget(null);
+      setDeepLinkNotice(result.status === "unavailable" ? "هذا الرابط غير متاح لهذا الحساب أو لم يعد موجودًا. لم نفتح مشروعًا أو مهمة من خارج صلاحياتك." : "");
+    }
+  }, [currentUser, data.projects, data.tasks, loading, locationSearch, navigationRevision]);
+  useEffect(() => {
+    if (!currentUser || loading || !linkedTarget || activeProject !== linkedTarget.projectId || !pendingDeepLinkFocus.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      const element = linkedTarget.taskId ? taskElementsRef.current.get(linkedTarget.taskId) : projectHeadingRef.current;
+      if (!element) return;
+      element.focus({ preventScroll: true });
+      element.scrollIntoView({ block: "center", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+      pendingDeepLinkFocus.current = false;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [currentUser, loading, linkedTarget, activeProject, statusFilter, priorityFilter, ownerFilter, search, data.tasks]);
+
+  function openSecretaryTarget(target: SecretaryTarget) {
+    const link = createSecretaryLink(window.location.origin, target);
+    if (!link) return;
+    const next = new URL(link);
+    // Revalidate against current state even when the caller is an activity row.
+    const result = resolveSecretaryDeepLink(next.search, currentUser, data.projects, data.tasks);
+    if (result.status !== "resolved") { toast.error("الرابط غير متاح لهذا الحساب."); return; }
+    window.history.pushState(null, "", `${next.pathname}${next.search}`);
+    setLocationSearch(next.search); setNavigationRevision(value => value + 1);
+    setActivityOpen(false);
+  }
 
   const activeProjects = data.projects.filter(project => project.status === "active");
   const pendingProjects = data.projects.filter(project => project.status === "pending");
@@ -196,7 +265,6 @@ export default function Dashboard() {
     const days = Math.max(0, Math.floor((now - startedAt) / 86400000));
     return `بدأت ${new Date(startedAt).toLocaleDateString("ar-JO")} · مضى ${days === 0 ? "اليوم" : `${days} يوم`}`;
   };
-  const activitySummary = (activity:Activity) => { try { return JSON.parse(activity.details).summary || activity.action; } catch { return activity.action; } };
 
   if (loading) return <main className="titanium-loading-screen"><div>جاري تجهيز فريق إدارة تيتانيوم…</div></main>;
 
@@ -233,21 +301,22 @@ export default function Dashboard() {
     </div></header>
 
     {currentUser && <section className="titanium-main">
-      <div className="titanium-projects">{activeProjects.map(project => { const tasks=data.tasks.filter(task=>task.projectId===project.id&&!task.archivedAt); const remaining=tasks.filter(task=>task.status!=="completed").length; return <button key={project.id} className={`titanium-project ${activeProject===project.id?"active":""}`} onClick={() => setActiveProject(project.id)}><strong>{project.name}</strong><span>{tasks.length} مهام · {remaining} متبقي</span></button>; })}</div>
+      <p className={`titanium-deep-link-notice${deepLinkNotice ? " visible" : ""}`} role="status" aria-live="polite">{deepLinkNotice}</p>
+      <div className="titanium-projects">{activeProjects.map(project => { const tasks=data.tasks.filter(task=>task.projectId===project.id&&!task.archivedAt); const remaining=tasks.filter(task=>task.status!=="completed").length; return <button key={project.id} className={`titanium-project ${activeProject===project.id?"active":""}`} aria-pressed={activeProject===project.id} onClick={() => openSecretaryTarget({ projectId: project.id })}><strong>{project.name}</strong><span>{tasks.length} مهام · {remaining} متبقي</span></button>; })}</div>
       {isAdmin && (pendingProjects.length > 0 || rejectedProjects.length > 0) && <div className="titanium-project-review">
         {pendingProjects.map(project => <div key={project.id} className="titanium-review-card"><div><strong>{project.name}</strong><span>أضافه {project.createdBy} · بانتظار القرار</span></div><div><Button size="sm" onClick={() => mutate({ action:"approve_project", projectId:project.id }, "تم اعتماد المشروع")}>اعتماد</Button><Button size="sm" variant="destructive" onClick={() => { setRejectProject(project); setProjectRejectReason(""); }}>رفض</Button></div></div>)}
         {rejectedProjects.map(project => <div key={project.id} className="titanium-review-card rejected"><div><strong>{project.name}</strong><span>مرفوض: {project.rejectionReason}</span></div><Button size="sm" variant="outline" onClick={() => mutate({ action:"restore_project", projectId:project.id }, "عاد المشروع للمراجعة")}><RotateCcw /> استرجاع</Button></div>)}
       </div>}
 
-      <div className="titanium-toolbar"><div><h2>{activeProjectInfo?.name || "المشاريع"}</h2><p>{projectTasks.filter(task=>!task.archivedAt).length} مهام · {projectTasks.filter(task=>!task.archivedAt&&task.status!=="completed").length} متبقي</p></div>{isAdmin&&<Dialog open={taskOpen} onOpenChange={setTaskOpen}><DialogTrigger asChild><Button disabled={!activeProject}><Plus /> مهمة</Button></DialogTrigger><DialogContent dir="rtl"><DialogHeader className="text-right"><DialogTitle>إضافة مهمة</DialogTitle><DialogDescription>اكتب المطلوب وحدد الأولوية والموعد والمسؤول.</DialogDescription></DialogHeader><TaskForm title={taskTitle} setTitle={setTaskTitle} details={taskDetails} setDetails={setTaskDetails} priority={taskPriority} setPriority={setTaskPriority} due={taskDue} setDue={setTaskDue} suggested={taskSuggested} setSuggested={setTaskSuggested} users={activeUsers} /><Button onClick={async () => { if (await mutate({ action:"add_task", projectId:activeProject, title:taskTitle, details:taskDetails, priority:taskPriority, dueDate:taskDue, suggestedOwner:taskSuggested }, "تمت إضافة المهمة")) { setTaskTitle(""); setTaskDetails(""); setTaskDue(""); setTaskSuggested(""); setTaskOpen(false); } }}>حفظ المهمة</Button></DialogContent></Dialog>}</div>
+      <div className="titanium-toolbar"><div><h2 ref={projectHeadingRef} tabIndex={-1} className={linkedTarget?.projectId === activeProject && !linkedTarget.taskId ? "titanium-linked-project" : undefined}>{activeProjectInfo?.name || "المشاريع"}</h2><p>{projectTasks.filter(task=>!task.archivedAt).length} مهام · {projectTasks.filter(task=>!task.archivedAt&&task.status!=="completed").length} متبقي</p>{activeProjectInfo && <SecretaryLinkButton key={activeProjectInfo.id} target={{ projectId: activeProjectInfo.id }} />}</div>{isAdmin&&<Dialog open={taskOpen} onOpenChange={setTaskOpen}><DialogTrigger asChild><Button disabled={!activeProject}><Plus /> مهمة</Button></DialogTrigger><DialogContent dir="rtl"><DialogHeader className="text-right"><DialogTitle>إضافة مهمة</DialogTitle><DialogDescription>اكتب المطلوب وحدد الأولوية والموعد والمسؤول.</DialogDescription></DialogHeader><TaskForm title={taskTitle} setTitle={setTaskTitle} details={taskDetails} setDetails={setTaskDetails} priority={taskPriority} setPriority={setTaskPriority} due={taskDue} setDue={setTaskDue} suggested={taskSuggested} setSuggested={setTaskSuggested} users={activeUsers} /><Button onClick={async () => { if (await mutate({ action:"add_task", projectId:activeProject, title:taskTitle, details:taskDetails, priority:taskPriority, dueDate:taskDue, suggestedOwner:taskSuggested }, "تمت إضافة المهمة")) { setTaskTitle(""); setTaskDetails(""); setTaskDue(""); setTaskSuggested(""); setTaskOpen(false); } }}>حفظ المهمة</Button></DialogContent></Dialog>}</div>
 
       <div className="titanium-filters"><div className="titanium-search"><Search /><Input value={search} onChange={event=>setSearch(event.target.value)} placeholder="ابحث في المهام والتعليقات" /></div><Select value={ownerFilter} onValueChange={setOwnerFilter}><SelectTrigger><SelectValue placeholder="المسؤول" /></SelectTrigger><SelectContent><SelectItem value="all">كل المسؤولين</SelectItem><SelectItem value="unassigned">غير مستلمة</SelectItem>{activeUsers.map(user=><SelectItem key={user.id} value={user.name}>{user.name}</SelectItem>)}</SelectContent></Select><Select value={statusFilter} onValueChange={setStatusFilter}><SelectTrigger><SelectValue placeholder="الحالة" /></SelectTrigger><SelectContent><SelectItem value="all">كل الحالات</SelectItem><SelectItem value="open">مفتوحة</SelectItem><SelectItem value="progress">قيد التنفيذ</SelectItem><SelectItem value="approval">بانتظار باسم</SelectItem><SelectItem value="completed">مكتملة</SelectItem><SelectItem value="archived">الأرشيف</SelectItem></SelectContent></Select><Select value={priorityFilter} onValueChange={setPriorityFilter}><SelectTrigger><SelectValue placeholder="الأولوية" /></SelectTrigger><SelectContent><SelectItem value="all">كل الأولويات</SelectItem><SelectItem value="red">حمراء</SelectItem><SelectItem value="yellow">صفراء</SelectItem><SelectItem value="green">خضراء</SelectItem></SelectContent></Select></div>
 
       <div className="titanium-task-list">{visibleTasks.length===0&&<div className="titanium-empty">لا توجد مهام مطابقة للفلاتر.</div>}{visibleTasks.map(task => {
-        const allComments=data.comments.filter(comment=>comment.taskId===task.id); const taskComments=expandedComments[task.id]?allComments:allComments.slice(0,5); const files=data.attachments.filter(file=>file.taskId===task.id); const overdue=task.dueDate&&task.status!=="completed"&&new Date(`${task.dueDate}T23:59:59`).getTime()<now; const canClaim=isAdmin||task.suggestedOwner===currentUser.name; const canWork=isAdmin||(task.owner===currentUser.name&&task.status==="progress"); const hasStartedWork=Boolean(task.startedAt&&(allComments.some(comment=>comment.createdAt>=task.startedAt!)||files.some(file=>file.createdAt>=task.startedAt!)));
-        return <article className={`titanium-task${task.rejectionReason?" titanium-task-rejected":""}${task.archivedAt?" titanium-task-archived":""}`} key={task.id}><span className={`titanium-priority ${task.priority}`} aria-label="الأولوية" /><div><h3 className="titanium-task-title">{task.title}</h3><p className="titanium-task-meta">{task.details||"بدون تفاصيل"}{task.owner?` · المسؤول: ${task.owner}`:""}{task.dueDate?` · الموعد: ${task.dueDate}`:""}</p><span className={`titanium-status ${task.status}${overdue?" overdue":""}`}>{task.archivedAt?"مؤرشفة":statusLabel[task.status]}{overdue?" · متأخرة":""}</span>{!task.archivedAt&&task.status==="open"&&task.suggestedOwner&&<span className="titanium-suggested-badge">مقترحة لـ: {task.suggestedOwner} · إشعار واتساب تلقائي</span>}{task.rejectionReason&&<p className="titanium-reject-banner">⚠️ رفضها باسم وأعادها إلى {task.owner||"المسؤول"} — السبب: {task.rejectionReason}</p>}</div>
+        const allComments=data.comments.filter(comment=>comment.taskId===task.id).sort((a,b)=>b.createdAt-a.createdAt||b.id-a.id); const taskComments=expandedComments[task.id]?allComments:allComments.slice(0,5); const files=data.attachments.filter(file=>file.taskId===task.id); const overdue=task.dueDate&&task.status!=="completed"&&new Date(`${task.dueDate}T23:59:59`).getTime()<now; const canClaim=isAdmin||task.suggestedOwner===currentUser.name; const canWork=isAdmin||(task.owner===currentUser.name&&task.status==="progress"); const hasStartedWork=Boolean(task.startedAt&&(allComments.some(comment=>comment.createdAt>=task.startedAt!)||files.some(file=>file.createdAt>=task.startedAt!)));
+        return <article ref={element=>{if(element)taskElementsRef.current.set(task.id,element);else taskElementsRef.current.delete(task.id);}} tabIndex={-1} aria-labelledby={`titanium-task-title-${task.id}`} aria-current={linkedTarget?.taskId===task.id?"location":undefined} className={`titanium-task${task.rejectionReason?" titanium-task-rejected":""}${task.archivedAt?" titanium-task-archived":""}${linkedTarget?.taskId===task.id?" titanium-linked-task":""}`} key={task.id}><span className={`titanium-priority ${task.priority}`} aria-label="الأولوية" /><div><h3 id={`titanium-task-title-${task.id}`} className="titanium-task-title">{task.title}</h3><p className="titanium-task-meta">{task.details||"بدون تفاصيل"}{task.owner?` · المسؤول: ${task.owner}`:""}{task.dueDate?` · الموعد: ${task.dueDate}`:""}</p><span className={`titanium-status ${task.status}${overdue?" overdue":""}`}>{task.archivedAt?"مؤرشفة":statusLabel[task.status]}{overdue?" · متأخرة":""}</span>{task.status==="approval"&&<p className="titanium-approval-note">بانتظار اعتماد باسم؛ لم تُعتمد نهائيًا بعد.</p>}{!task.archivedAt&&task.status==="open"&&task.suggestedOwner&&<span className="titanium-suggested-badge">مقترحة لـ: {task.suggestedOwner} · إشعار واتساب تلقائي</span>}{task.rejectionReason&&<p className="titanium-reject-banner">⚠️ رفضها باسم وأعادها إلى {task.owner||"المسؤول"} — السبب: {task.rejectionReason}</p>}<SecretaryLinkButton target={{ projectId: task.projectId, taskId: task.id }} /></div>
           <div className="titanium-task-actions">{isAdmin&&<Button size="sm" variant="outline" onClick={()=>setEditTask(task)}><Edit3 /> تعديل</Button>}{!task.archivedAt&&task.status==="open"&&canClaim&&<Button size="sm" className="titanium-claim-button" onClick={()=>mutate({action:"claim",taskId:task.id},"استلمت المهمة")}>استلام المهمة</Button>}{!task.archivedAt&&task.status==="progress"&&canWork&&<><Button size="sm" onClick={()=>mutate({action:"submit",taskId:task.id},"أُرسلت لاعتماد باسم")}>تم التنفيذ</Button>{(isAdmin||!hasStartedWork)&&<Button size="sm" variant="outline" onClick={()=>mutate({action:"cancel_claim",taskId:task.id},"تم إرجاع المهمة")}><XCircle /> إرجاع المهمة</Button>}</>}{!task.archivedAt&&task.status==="approval"&&isAdmin&&<><Button size="sm" onClick={()=>mutate({action:"approve",taskId:task.id},"تم اعتماد المهمة")}>موافقة</Button><Button size="sm" variant="destructive" onClick={()=>mutate({action:"reject",taskId:task.id,reason:rejectReasons[task.id]||""},"عادت المهمة للمسؤول لاستكمالها")}>رفض</Button></>}{isAdmin&&<><Button size="sm" variant="outline" onClick={()=>{setReassignTask(task);setReassignUserId(activeUsers.find(user=>user.name===(task.suggestedOwner||task.owner))?.id||"");}}><UserCog /> تعيين</Button>{task.archivedAt?<Button size="sm" variant="outline" onClick={()=>mutate({action:"restore_task",taskId:task.id},"تم استرجاع المهمة")}><RotateCcw /> استرجاع</Button>:<Button size="sm" variant="outline" onClick={()=>mutate({action:"archive_task",taskId:task.id},"تمت أرشفة المهمة")}><Archive /> أرشفة</Button>}<Button size="sm" variant="destructive" onClick={()=>setDeleteTask(task)}><Trash2 /> حذف</Button></>}</div>
-          <div className="titanium-task-details"><div className="titanium-field"><label>تعليق للفريق</label>{canWork&&<div className="titanium-comment-box"><Input value={comments[task.id]||""} onChange={event=>setComments(current=>({...current,[task.id]:event.target.value}))} placeholder="اكتب تحديثاً على التنفيذ" /><Button className="titanium-save-button" onClick={async()=>{if(await mutate({action:"comment",taskId:task.id,comment:comments[task.id]||""},"تم حفظ التعليق"))setComments(current=>({...current,[task.id]:""}));}}>حفظ</Button></div>}{taskComments.length>0&&<div className="titanium-comments-list">{taskComments.map(comment=><article className="titanium-comment-card" key={comment.id}><div className="titanium-comment-head"><span className="titanium-comment-number">تعليق #{comment.id}</span><strong>{comment.author}</strong><time>{new Date(comment.createdAt).toLocaleString("ar-JO")}</time></div><p>{comment.body}</p></article>)}{allComments.length>5&&<Button size="sm" variant="ghost" onClick={()=>setExpandedComments(current=>({...current,[task.id]:!current[task.id]}))}>{expandedComments[task.id]?"عرض آخر 5":"عرض كل التعليقات"}</Button>}</div>}</div>
+          <div className="titanium-task-details"><div className="titanium-field"><label>تعليقات وتحديثات الفريق ({allComments.length})</label>{canWork&&<div className="titanium-comment-box"><Input value={comments[task.id]||""} onChange={event=>setComments(current=>({...current,[task.id]:event.target.value}))} placeholder="اكتب تحديثاً على التنفيذ" aria-label={`تحديث على مهمة ${task.title}`} /><Button className="titanium-save-button" onClick={async()=>{if(await mutate({action:"comment",taskId:task.id,comment:comments[task.id]||""},"تم حفظ التعليق"))setComments(current=>({...current,[task.id]:""}));}}>حفظ</Button></div>}{taskComments.length===0&&<p className="titanium-muted">لا توجد تحديثات مسجلة بعد.</p>}{taskComments.length>0&&<div className="titanium-comments-list">{allComments.length>5&&!expandedComments[task.id]&&<p className="titanium-muted">أحدث 5 تعليقات من {allComments.length}.</p>}{taskComments.map(comment=><article className="titanium-comment-card" key={comment.id}><div className="titanium-comment-head"><span className="titanium-comment-number">تعليق #{comment.id}</span><strong>{comment.author}</strong><time>{new Date(comment.createdAt).toLocaleString("ar-JO")}</time></div><p>{comment.body}</p></article>)}{allComments.length>5&&<Button size="sm" variant="ghost" aria-expanded={!!expandedComments[task.id]} onClick={()=>setExpandedComments(current=>({...current,[task.id]:!current[task.id]}))}>{expandedComments[task.id]?"عرض آخر 5":"عرض كل التعليقات"}</Button>}</div>}</div>
             <div className="titanium-files"><div className="titanium-files-head"><label><Paperclip /> الملفات ({files.length})</label>{canWork&&<label className="titanium-upload-button"><Upload /> إرفاق<input type="file" accept="image/jpeg,image/png,image/webp,application/pdf,.doc,.docx,.xls,.xlsx,.txt" onChange={event=>{void uploadAttachment(task.id,event.target.files?.[0]||null);event.currentTarget.value="";}} /></label>}</div>{files.length===0?<span className="titanium-muted">لا توجد مرفقات</span>:files.map(file=><div className="titanium-file-row" key={file.id}><a href={`/api/attachments?id=${encodeURIComponent(file.id)}`}><FileText /> <span>{file.fileName}</span><small>{formatBytes(file.size)} · {file.uploadedBy}</small></a>{isAdmin&&<Button size="sm" variant="ghost" onClick={()=>removeAttachment(file.id)}><Trash2 /></Button>}</div>)}</div>
             {task.status==="approval"&&isAdmin?<div className="titanium-field"><label>سبب الرفض عند الحاجة</label><Input value={rejectReasons[task.id]||""} onChange={event=>setRejectReasons(current=>({...current,[task.id]:event.target.value}))} placeholder="يُكتب عند الرفض" /></div>:<div className="titanium-start"><Clock3 /> {daysSince(task.startedAt)}</div>}
           </div>
@@ -263,7 +332,7 @@ export default function Dashboard() {
 
     <Dialog open={usersOpen} onOpenChange={setUsersOpen}><DialogContent dir="rtl" className="titanium-wide-dialog"><DialogHeader className="text-right"><DialogTitle>{whatsappLogin ? "إدارة المستخدمين" : "إدارة المستخدمين والأكواد"}</DialogTitle><DialogDescription>باسم هو المدير الوحيد. أعضاء الفريق يستلمون مهامهم ويحدّثون التنفيذ فقط.</DialogDescription></DialogHeader>{whatsappLogin && <p className="titanium-dialog-note">الدخول برمز مؤقت يُرسل إلى رقم واتساب المسجّل للموظف. إضافة اسم جديد هنا لا تربطه برقم؛ يلزم تسجيل رقمه في إعدادات الدخول الخاصة.</p>}<div className="titanium-user-add"><Input value={userName} onChange={event=>setUserName(event.target.value)} placeholder="اسم المستخدم الجديد" /><Button onClick={async()=>{if(await mutate({action:"add_user",name:userName},"تمت إضافة المستخدم")){setUserName("");}}}><Plus /> إضافة عضو</Button></div><div className="titanium-users-list">{data.users.map(user=><div className={`titanium-user-row${whatsappLogin?" titanium-user-row-whatsapp":""}${user.active?"":" inactive"}`} key={user.id}><div><strong>{user.name}</strong><span>{user.id==="basem"?"المدير الوحيد":whatsappLogin?"عضو · الدخول برمز واتساب":user.pinSet?"عضو · الكود مضبوط":"عضو · بحاجة لكود"}</span></div><Button size="sm" variant={user.active?"outline":"secondary"} disabled={user.id==="basem"} onClick={()=>mutate({action:"update_user",userId:user.id,role:user.role,active:!user.active},user.active?"تم إيقاف المستخدم":"تم تفعيل المستخدم")}>{user.active?"إيقاف":"تفعيل"}</Button>{!whatsappLogin && <><Input type="password" inputMode="numeric" value={userPins[user.id]||""} onChange={event=>setUserPins(current=>({...current,[user.id]:event.target.value}))} placeholder="كود جديد" /><Button size="sm" onClick={async()=>{if(await mutate({action:"set_user_pin",userId:user.id,pin:userPins[user.id]||""},`تم تغيير كود ${user.name}`))setUserPins(current=>({...current,[user.id]:""}));}}><KeyRound /> حفظ الكود</Button></>}</div>)}</div></DialogContent></Dialog>
     {!whatsappLogin && <Dialog open={changePinOpen} onOpenChange={setChangePinOpen}><DialogContent dir="rtl"><DialogHeader className="text-right"><DialogTitle>تغيير كودي</DialogTitle><DialogDescription>اكتب الكود الحالي ثم الكود الجديد من 4 إلى 8 أرقام.</DialogDescription></DialogHeader><div className="titanium-dialog-grid"><Input type="password" inputMode="numeric" value={oldPin} onChange={event=>setOldPin(event.target.value)} placeholder="الكود الحالي" /><Input type="password" inputMode="numeric" value={newPin} onChange={event=>setNewPin(event.target.value)} placeholder="الكود الجديد" /><Button onClick={async()=>{if(await mutate({action:"change_own_pin",oldPin,newPin},"تم تغيير الكود")){setOldPin("");setNewPin("");setChangePinOpen(false);}}}>حفظ الكود الجديد</Button></div></DialogContent></Dialog>}
-    <Dialog open={activityOpen} onOpenChange={setActivityOpen}><DialogContent dir="rtl" className="titanium-wide-dialog"><DialogHeader className="text-right"><DialogTitle>سجل النشاط الكامل</DialogTitle><DialogDescription>من قام بكل تغيير وتاريخه ووقته.</DialogDescription></DialogHeader><div className="titanium-activity-list">{data.activity.length===0?<div className="titanium-empty">لا يوجد نشاط مسجل بعد.</div>:data.activity.map(item=><div className="titanium-activity-row" key={item.id}><span className="titanium-activity-icon"><History /></span><div><strong>{item.actorName}</strong><p>{activitySummary(item)}</p></div><time>{new Date(item.createdAt).toLocaleString("ar-JO")}</time></div>)}</div></DialogContent></Dialog>
+    <Dialog open={activityOpen} onOpenChange={setActivityOpen}><DialogContent dir="rtl" className="titanium-wide-dialog"><DialogHeader className="text-right"><DialogTitle>سجل النشاط المتاح لك</DialogTitle><DialogDescription>صاحب التغيير وتوقيته، وتفاصيل طلب السكرتير وتأكيده بحسب صلاحياتك.</DialogDescription></DialogHeader><div className="titanium-activity-list">{data.activity.length===0?<div className="titanium-empty">لا يوجد نشاط مسجل بعد.</div>:data.activity.map(item=><SecretaryActivity key={item.id} activity={item} viewer={currentUser} target={secretaryActivityTarget(item,currentUser,data.projects,data.tasks)} onOpen={openSecretaryTarget} />)}</div></DialogContent></Dialog>
   </main>;
 }
 

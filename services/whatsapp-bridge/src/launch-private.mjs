@@ -6,7 +6,8 @@ import { loadConfig } from './config.mjs';
 
 const SETTINGS_KEYS = new Set(['TEAM_CHAT_ENABLED', 'TEAM_CHAT_SHARED_KEY', 'TEAM_CHAT_CONTACTS_JSON',
   'TEAM_CHAT_GROUP_IDS_JSON', 'GROQ_API_KEY', 'GROQ_MODEL', 'WHATSAPP_LOGIN_ENABLED',
-  'WHATSAPP_LOGIN_SECRET', 'WHATSAPP_LOGIN_DATABASE', 'WHATSAPP_LOGIN_ORIGIN']);
+  'WHATSAPP_LOGIN_SECRET', 'WHATSAPP_LOGIN_DATABASE', 'WHATSAPP_LOGIN_ORIGIN',
+  'SECRETARY_ENABLED', 'SECRETARY_WEB_ENABLED', 'SECRETARY_VOICE_ENABLED']);
 const MAX_BYTES = 32_768;
 const SERVICE_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -62,8 +63,10 @@ export function bridgeChildEnvironment(settings, env, pair, serviceDirectory = S
       groups.some(group => typeof group !== 'string' || !/^\d+(?:-\d+)?@g\.us$/.test(group))) {
     throw new Error('Invalid bridge allowlists.');
   }
-  const numbers = contacts.map(contact => normalizedContact(contact.number));
-  if (new Set(numbers).size !== numbers.length || new Set(groups).size !== groups.length) throw new Error('Duplicate bridge allowlist entry.');
+  const allNumbers = contacts.map(contact => normalizedContact(contact.number));
+  if (new Set(allNumbers).size !== allNumbers.length || new Set(groups).size !== groups.length) throw new Error('Duplicate bridge allowlist entry.');
+  const numbers = contacts.filter(contact => contact.active !== false && contact.verified !== false)
+    .map(contact => normalizedContact(contact.number));
   // Minimal environment: do not inherit GROQ keys, raw JSON, config path,
   // NODE_OPTIONS, other application secrets, or a caller's pairing/enable flags.
   const childEnv = {};
@@ -82,7 +85,22 @@ export function bridgeChildEnvironment(settings, env, pair, serviceDirectory = S
     TEAM_CHAT_BOT_NUMBER: env.TEAM_CHAT_BOT_NUMBER,
     TEAM_CHAT_BACKEND_URL: env.TEAM_CHAT_BACKEND_URL,
     TEAM_CHAT_STATE_DIR: env.TEAM_CHAT_STATE_DIR,
+    SECRETARY_ENABLED: settings.SECRETARY_ENABLED === '1' ? '1' : '0',
+    SECRETARY_VOICE_ENABLED: settings.SECRETARY_ENABLED === '1' && settings.SECRETARY_VOICE_ENABLED === '1' ? '1' : '0',
   });
+  // Explicit owner consent: this key is used only for bounded voice transcription on the server.
+  if (childEnv.SECRETARY_VOICE_ENABLED === '1') {
+    if (typeof settings.GROQ_API_KEY !== 'string' || !settings.GROQ_API_KEY.trim() || /[\r\n]/.test(settings.GROQ_API_KEY)) throw new Error('Voice settings unavailable.');
+    childEnv.GROQ_API_KEY = settings.GROQ_API_KEY;
+  }
+  // Phone/user mapping only; no names, AI key, or protected config path crosses into the transport.
+  if (path.isAbsolute(settings.WHATSAPP_LOGIN_DATABASE || '')) {
+    childEnv.TEAM_CHAT_AUTH_DATABASE = settings.WHATSAPP_LOGIN_DATABASE;
+    childEnv.TEAM_CHAT_AUTH_CONTACTS_JSON = JSON.stringify(contacts.map(contact => ({
+      userId: contact.userId, number: normalizedContact(contact.number),
+      ...(contact.active === false ? { active: false } : {}), ...(contact.verified === false ? { verified: false } : {}),
+    })));
+  }
   if (['1', 'pilot'].includes(settings.WHATSAPP_LOGIN_ENABLED)) {
     if (!/^[a-fA-F0-9]{64}$/.test(settings.WHATSAPP_LOGIN_SECRET || '') ||
       settings.WHATSAPP_LOGIN_SECRET.toLowerCase() === settings.TEAM_CHAT_SHARED_KEY?.toLowerCase() ||

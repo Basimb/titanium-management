@@ -1,4 +1,5 @@
 import { createHmac } from 'node:crypto';
+import { boundedPlainText } from './group-privacy.mjs';
 
 export function signatureHeaders(rawBody, key, now) {
   const timestamp = String(now);
@@ -31,16 +32,23 @@ async function boundedResponse(response) {
     throw new Error('invalid_response');
   }
   // Deliberately discard all extra response fields, especially any recipient.
-  return { status: result.status, reply: result.reply, ...(result.taskId ? { taskId: result.taskId } : {}) };
+  return { status: result.status, reply: boundedPlainText(result.reply), ...(result.taskId ? { taskId: result.taskId } : {}) };
 }
 
-export async function deliverOne(store, row, config, { fetcher = fetch, sendReply, now = Date.now }) {
+export async function deliverOne(store, row, config, { fetcher = fetch, sendReply, now = Date.now,
+  authorizeChat, onPrivacyBlocked = async () => {} }) {
   let body;
   try { body = JSON.parse(row.raw_body); } catch { store.fail(row.id, 'invalid_stored_body'); return; }
   // A removed employee/group must not regain access through an old queued row.
   if (!config.allowedNumbers.has(body.senderNumber) || body.senderNumber === config.botNumber ||
       (body.groupId !== null && (!config.allowedGroups.has(body.groupId) || body.groupId !== row.chat_jid))) {
     store.fail(row.id, 'authorization_removed');
+    return;
+  }
+  // Check before both inference/mutation and delivery. Missing group policy fails closed.
+  if ((body.groupId !== null && !authorizeChat) || (authorizeChat && !await authorizeChat(body))) {
+    store.fail(row.id, 'privacy_check_failed');
+    await onPrivacyBlocked(body).catch(() => {});
     return;
   }
   if (row.state === 'backend') {
@@ -51,8 +59,8 @@ export async function deliverOne(store, row, config, { fetcher = fetch, sendRepl
       response = await fetcher(config.backendUrl, {
         method: 'POST', body: row.raw_body,
         headers: signatureHeaders(row.raw_body, config.key, now()),
-        // Exceed the backend's 12s inference deadline plus DB/reply overhead.
-        redirect: 'error', signal: AbortSignal.timeout(30_000),
+        // Cover the 18s planner plus optional 22s public search and DB/reply overhead.
+        redirect: 'error', signal: AbortSignal.timeout(50_000),
       });
     } catch {
       if (row.backend_attempts + 1 >= 5) store.fail(row.id, 'backend_retry_exhausted');
@@ -79,7 +87,7 @@ export async function deliverOne(store, row, config, { fetcher = fetch, sendRepl
     store.attemptReply(row.id);
     try {
       // original chat and a persisted outgoing ID; never route from response text.
-      await sendReply(row.chat_jid, row.reply, row.reply_id);
+      await sendReply(row.chat_jid, boundedPlainText(row.reply), row.reply_id, body);
       store.done(row.id);
     } catch {
       if (row.reply_attempts + 1 >= 3) store.fail(row.id, 'reply_retry_exhausted');

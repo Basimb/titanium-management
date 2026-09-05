@@ -24,7 +24,7 @@ export default function PrivacyPage() {
           <h3><span>01</span> نطاق الخدمة</h3>
           <p>
             Titanium Management أداة داخلية لتنظيم مشاريع ومهام فريق الإدارة. يتيح تكامل WhatsApp
-            إرسال التنبيهات والتذكيرات واستقبال أوامر إدارية من الرقم المصرّح له فقط.
+            إرسال التنبيهات والتذكيرات واستقبال تحديثات الموظفين المصرّح لهم. الأوامر الإدارية تبقى لصاحب صلاحية الإدارة فقط.
           </p>
         </section>
 
@@ -33,6 +33,7 @@ export default function PrivacyPage() {
           <ul>
             <li><strong>بيانات WhatsApp:</strong> رقم المرسل، معرّف الرسالة ونوعها ونصها، وقت المعالجة، ونتيجة تنفيذ الأمر أو حالة الإرسال.</li>
             <li><strong>بيانات النظام الداخلي:</strong> اسم المستخدم ودوره، المشاريع والمهام والتعليقات والمرفقات وسجل النشاط والتواريخ المرتبطة بها.</li>
+            <li><strong>الرسائل الصوتية عند تفعيلها:</strong> مقطع عمل قصير حتى دقيقة واحدة يُحوّل إلى نص؛ لا نحفظ ملف الصوت على خادم التطبيق، ونحتفظ بالنص ونتيجة المعالجة كسجل عمل.</li>
             <li><strong>بيانات تقنية أساسية:</strong> قد تعالج خدمات Meta وWhatsApp والاستضافة سجلات الاتصال والأمان اللازمة لتشغيل الخدمة وحمايتها.</li>
           </ul>
           <p>نستلم هذه البيانات منك مباشرة، أو من WhatsApp/Meta عندما تراسل حساب الخدمة.</p>
@@ -44,6 +45,7 @@ export default function PrivacyPage() {
             نستخدم البيانات للتحقق من الصلاحيات، وتنفيذ أوامر المدير، وإدارة المهام، وإرسال التنبيهات،
             ومنع تكرار معالجة الرسائل، وحماية الخدمة وتشخيص الأعطال. لا نستخدمها للإعلانات ولا نبيعها.
           </p>
+          <p>يُستخدم Groq لفهم نصوص العمل والعناوين المسموحة وسياق محادثة محدود للشخص نفسه، ولتفريغ المقاطع الصوتية عند تفعيل هذه الميزة. لا نرسل إليه جدول أرقام الموظفين أو مفاتيح الدخول. البحث العام منفصل عن بيانات المشاريع، وقد يستخدم Groq مزوّد البحث Tavily. ردود الجروب مرئية لأعضائه؛ لا ترسلوا معلومات مرضى أو كلمات مرور أو رموز دخول إلى السكرتير.</p>
         </section>
 
         <section>
@@ -58,7 +60,7 @@ export default function PrivacyPage() {
         <section>
           <h3><span>05</span> خياراتك وحماية البيانات</h3>
           <p>
-            نستخدم ضوابط وصول وصلاحيات وتحقق من رسائل Meta لحماية النظام. لا توجد وسيلة إلكترونية مضمونة
+            نستخدم ضوابط وصول وصلاحيات والتحقق من هوية مرسل الرسالة وتوقيع الاتصال بين خدمة الربط والموقع. لا توجد وسيلة إلكترونية مضمونة
             بالكامل. يمكنك طلب حذف بياناتك باتباع <Link href="/data-deletion">تعليمات حذف البيانات</Link>.
             لا ترسل كلمة مرور أو رمز تحقق ضمن طلبك.
           </p>
@@ -83,7 +85,7 @@ export default function PrivacyPage() {
           <h3><span>01</span> Service scope</h3>
           <p>
             Titanium Management is an internal project and task management tool. Its WhatsApp integration
-            sends alerts and reminders and accepts administrative commands only from the authorized number.
+            sends alerts and reminders and accepts updates from authorized staff. Administrative commands remain restricted to the authorized administrator.
           </p>
         </section>
 
@@ -92,6 +94,7 @@ export default function PrivacyPage() {
           <ul>
             <li><strong>WhatsApp data:</strong> sender number, message identifier, type and text, processing time, and the command result or delivery status.</li>
             <li><strong>Internal app data:</strong> user name and role, projects, tasks, comments, attachments, activity records, and related timestamps.</li>
+            <li><strong>Voice when enabled:</strong> work voice notes up to one minute are transcribed. The application does not save the audio file to disk; the transcript and processing result form part of the work record.</li>
             <li><strong>Basic technical data:</strong> Meta, WhatsApp, and hosting services may process connection and security logs needed to operate and protect the service.</li>
           </ul>
           <p>We receive this data directly from you or from WhatsApp/Meta when you message the service account.</p>
@@ -113,12 +116,13 @@ export default function PrivacyPage() {
             the service. We keep it for a reasonable operational period needed for team management and security,
             then delete it or reduce its association with individuals when it is no longer needed.
           </p>
+          <p>Groq processes work text, authorized task titles and limited same-person conversation context, and transcribes voice when enabled. We do not send the employee phone directory or login credentials to the language planner. Public research is separate from project data and may use Groq&apos;s search provider Tavily. Group replies are visible to group members. Do not send patient information, passwords or login codes to the secretary.</p>
         </section>
 
         <section>
           <h3><span>05</span> Your choices and security</h3>
           <p>
-            We use access controls, permissions, and Meta message verification to protect the system, but no
+            We use access controls, permissions, authenticated sender identity and signed bridge requests to protect the system, but no
             electronic method is completely secure. You may request deletion by following our
             {" "}<Link href="/data-deletion">Data Deletion Instructions</Link>. Never include a password or
             verification code in your request.

@@ -14,7 +14,8 @@ const botNumber = '15551234568';
 const member = '15551234567';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false, otpQueue } = {}) {
+function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false, otpQueue,
+  isActiveNumber = number => number === member, control, secretaryJobs } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'titanium-bridge-runtime-test-'));
   const store = openStore(directory);
   const logger = pino({ level: 'silent' });
@@ -35,7 +36,7 @@ function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false
     clearInterval(job) { if (job) job.cleared = true; },
   };
   const runtime = createBridgeRuntime({
-    ...baileys, config, store, auth, logger, now: () => clock, timers, otpQueue,
+    ...baileys, config, store, auth, logger, now: () => clock, timers, otpQueue, isActiveNumber, control, secretaryJobs,
     makeWASocket(options) {
       // Never call the actual Baileys factory. Every network-capable method is mocked.
       const socket = { options, ev: new EventEmitter(), authState: options.auth, pairCalls: [], endCalls: 0,
@@ -61,8 +62,59 @@ function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false
     assert.ok(path.basename(resolved).startsWith('titanium-bridge-runtime-test-'));
     rmSync(resolved, { recursive: true, force: true });
   });
-  return { store, auth, sockets, stopped, output, timerJobs, intervals, runtime };
+  return { config, store, auth, sockets, stopped, output, timerJobs, intervals, runtime };
 }
+
+test('fresh group privacy check blocks queued sensitive reply if outsider joins or account is disabled', async t => {
+  const group = '120363000000000000@g.us';
+  let active = true;
+  const h = harness(t, { isActiveNumber: () => active });
+  h.config.allowedGroups.add(group);
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  let queries = 0;
+  let outsider = false;
+  socket.groupMetadata = async () => { queries++; return { id: group, size: outsider ? 3 : 2, participants: [
+    { id: `${botNumber}@s.whatsapp.net` }, { id: `${member}@s.whatsapp.net` },
+    ...(outsider ? [{ id: '15559999999@s.whatsapp.net' }] : [])] }; };
+  const sent = [];
+  socket.sendMessage = async (...args) => sent.push(args);
+  const enqueueReply = id => {
+    h.store.enqueue({ chatJid: group, body: { messageId: id, senderNumber: member, groupId: group, text: 'تقرير', receivedAt: clock } });
+    const row = h.store.next(clock); h.store.backendResult(row.id, { status: 'report', reply: 'SENSITIVE_REPORT' });
+  };
+  enqueueReply('FIRST');
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(sent.length, 1);
+  assert.ok(queries >= 2, 'before delivery and immediately before actual send both fetch fresh');
+  outsider = true;
+  enqueueReply('SECOND'); h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(sent.length, 1);
+  assert.equal(h.store.db.prepare("SELECT error_code FROM inbox WHERE json_extract(raw_body,'$.messageId')='SECOND'").get().error_code, 'privacy_check_failed');
+  outsider = false; active = false;
+  enqueueReply('THIRD'); h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(h.stopped, []);
+});
+
+test('group membership update during metadata authorization invalidates the send', async t => {
+  const group = '120363000000000000@g.us';
+  const h = harness(t);
+  h.config.allowedGroups.add(group);
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  socket.groupMetadata = async () => {
+    socket.ev.emit('group-participants.update', { id: group, action: 'add' });
+    return { id: group, size: 2, participants: [{ id: `${botNumber}@s.whatsapp.net` }, { id: `${member}@s.whatsapp.net` }] };
+  };
+  h.store.enqueue({ chatJid: group, body: { messageId: 'RACE', senderNumber: member, groupId: group, text: 'تقرير', receivedAt: clock } });
+  h.store.backendResult(h.store.next(clock).id, { status: 'report', reply: 'SENSITIVE_REPORT' });
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(h.store.db.prepare('SELECT error_code FROM inbox').get().error_code, 'privacy_check_failed');
+  assert.deepEqual(h.stopped, []);
+});
 
 test('installed Baileys exports and real auth serialization are compatible without a socket', async t => {
   for (const name of ['default', 'initAuthCreds', 'jidNormalizedUser', 'makeCacheableSignalKeyStore']) {
@@ -115,6 +167,85 @@ test('OTP refuses groups, unregistered phones, expired code and shutdown', async
   h.intervals[0].fn(); await flush();
   assert.deepEqual(h.stopped, []);
   assert.match(h.output.join('\n'), /Titanium login delivery: failed/);
+});
+
+test('scheduled secretary jobs keep private recipients allowlisted and abort hung sends without stopping OTP runtime', async t => {
+  const controller = new AbortController();
+  let attempted = false;
+  const h = harness(t, { secretaryJobs: { async deliverNext(send) {
+    for (const to of ['15559999999@s.whatsapp.net', 'attacker@lid', botNumber]) {
+      await assert.rejects(() => send({ to, text: 'PRIVATE_REMINDER', messageId: 'REMINDER_SAFE_ID', signal: controller.signal }));
+    }
+    attempted = true;
+    await assert.rejects(() => send({ to: member, text: 'PRIVATE_REMINDER', messageId: 'REMINDER_SAFE_ID', signal: controller.signal }));
+    return { status: 'failed' };
+  } } });
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  socket.sendMessage = async () => { controller.abort(); return new Promise(() => {}); };
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(attempted, true);
+  assert.deepEqual(h.stopped, []);
+  assert.match(h.output.join('\n'), /Titanium secretary delivery: failed/);
+  assert.doesNotMatch(h.output.join('\n'), /PRIVATE_REMINDER|1555/);
+});
+
+test('scheduled group delivery checks latest membership and never uses an outsider group', async t => {
+  const group = '120363000000000000@g.us';
+  const h = harness(t, { secretaryJobs: { async deliverNext(send) {
+    await assert.rejects(() => send({ to: group, text: 'PRIVATE_REMINDER', messageId: 'REMINDER_SAFE_ID', signal: new AbortController().signal }));
+    return { status: 'failed' };
+  } } });
+  h.config.allowedGroups.add(group);
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  let queries = 0;
+  socket.groupMetadata = async () => { queries++; return { id: group, size: 3, participants: [
+    { id: `${botNumber}@s.whatsapp.net` }, { id: `${member}@s.whatsapp.net` }, { id: '15559999999@s.whatsapp.net' }] }; };
+  h.intervals[0].fn(); await flush(); await flush();
+  assert.equal(queries, 1);
+  assert.deepEqual(h.stopped, []);
+});
+
+test('OTP has priority over secretary jobs and disabled task automation pauses secretary jobs', async t => {
+  let jobs = 0;
+  const h = harness(t, { otpQueue: { deliverNext: async () => ({ status: 'sent' }) },
+    secretaryJobs: { deliverNext: async () => { jobs++; return { status: 'idle' }; } } });
+  await h.runtime.start();
+  h.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush();
+  assert.equal(jobs, 0);
+  const second = harness(t, { secretaryJobs: { deliverNext: async () => { jobs++; return { status: 'idle' }; } } });
+  second.config.tasksEnabled = false;
+  await second.runtime.start();
+  second.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
+  second.intervals[0].fn(); await flush();
+  assert.equal(jobs, 0);
+});
+
+test('unsafe group gets only one generic private refusal to verified sender, no report in group', async t => {
+  const group = '120363000000000000@g.us';
+  let reserved = false;
+  const h = harness(t, { control: { claim: () => null, reservePrivacyAlert: () => {
+    if (reserved) return false; reserved = true; return true;
+  } } });
+  h.config.allowedGroups.add(group);
+  await h.runtime.start();
+  const socket = h.sockets[0];
+  socket.ev.emit('connection.update', { connection: 'open' }); await flush();
+  socket.groupMetadata = async () => ({ id: group, size: 3, participants: [
+    { id: `${botNumber}@s.whatsapp.net` }, { id: `${member}@s.whatsapp.net` }, { id: '15559999999@s.whatsapp.net' }] });
+  const sent = [];
+  socket.sendMessage = async (...args) => sent.push(args);
+  for (const id of ['BLOCKED_ONE', 'BLOCKED_TWO']) {
+    h.store.enqueue({ chatJid: group, body: { messageId: id, senderNumber: member, groupId: group, text: 'SENSITIVE_REPORT', receivedAt: clock } });
+    h.intervals[0].fn(); await flush(); await flush();
+  }
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0], `${member}@s.whatsapp.net`);
+  assert.doesNotMatch(sent[0][1].text, /SENSITIVE_REPORT|1555|120363/);
 });
 
 test('only open plus verified actual account marks runtime ready', async t => {

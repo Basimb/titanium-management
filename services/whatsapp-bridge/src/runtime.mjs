@@ -1,10 +1,22 @@
 import { resolvePhone, selectIncoming } from './identity.mjs';
 import { deliverOne } from './delivery.mjs';
+import { inspectGroupMembership, boundedPlainText, groupJid, withAbortSignal } from './group-privacy.mjs';
+import { processControlJob } from './control.mjs';
+import { selectVoiceIncoming } from './voice.mjs';
+
+function withDeadline(work) {
+  let timer;
+  return Promise.race([Promise.resolve().then(work), new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('metadata_timeout')), 10_000);
+    timer.unref?.();
+  })]).finally(() => clearTimeout(timer));
+}
 
 // Dependency injection allows lifecycle tests without initializing a real socket.
 export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNormalizedUser,
   makeCacheableSignalKeyStore, DisconnectReason, logger, onStop = () => {}, output = console,
-  now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch, otpQueue }) {
+  now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch, otpQueue,
+  control, isActiveNumber = () => false, secretaryJobs, transcribeVoice }) {
   let socket;
   let ready = false;
   let stopped = false;
@@ -16,6 +28,52 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   let reconnectTimer;
   let pairRequested = false;
   const groupCache = new Map();
+  const groupEpoch = new Map();
+
+  function invalidateGroup(jid) {
+    if (!config.allowedGroups.has(jid) && !groupEpoch.has(jid)) return;
+    groupCache.delete(jid);
+    groupEpoch.set(jid, (groupEpoch.get(jid) || 0) + 1);
+  }
+
+  async function inspectGroup(jid, mustBeAllowlisted = true) {
+    const unavailable = { allowed: false, reason: 'membership_unavailable', memberCount: 0 };
+    const current = socket;
+    const epoch = groupEpoch.get(jid) || 0;
+    if (!groupJid(jid) || !ready || stopped || (mustBeAllowlisted && !config.allowedGroups.has(jid))) return unavailable;
+    groupEpoch.set(jid, epoch);
+    try {
+      // ALWAYS ask WhatsApp now. cachedGroupMetadata is for this one send's encryption,
+      // never an authorization decision and never retained for five minutes.
+      const metadata = await withDeadline(() => current.groupMetadata(jid));
+      const result = await inspectGroupMembership(metadata, jid, config, {
+        normalizeJid: jidNormalizedUser,
+        lookupPhoneForLid: lid => current.signalRepository.lidMapping.getPNForLID(lid),
+      }, isActiveNumber);
+      if (current !== socket || stopped || !ready || epoch !== (groupEpoch.get(jid) || 0)) return unavailable;
+      if (result.allowed && mustBeAllowlisted) groupCache.set(jid, { metadata, expires: now() + 10_000 });
+      return result;
+    } catch { return unavailable; }
+    finally { if (!config.allowedGroups.has(jid)) groupEpoch.delete(jid); }
+  }
+
+  async function sendGroup(jid, text, messageId, signal) {
+    if (signal?.aborted) throw new Error('group_send_cancelled');
+    const check = await inspectGroup(jid);
+    if (!check.allowed || signal?.aborted) throw new Error('group_privacy_blocked');
+    try { await socket.sendMessage(jid, { text: boundedPlainText(text), linkPreview: null }, { messageId }); }
+    finally { groupCache.delete(jid); }
+  }
+
+  async function privacyRefusal(body) {
+    if (!body.groupId || !ready || stopped || !config.allowedNumbers.has(body.senderNumber) ||
+      !await isActiveNumber(body.senderNumber) || !control?.reservePrivacyAlert(body.groupId, body.senderNumber)) return;
+    // Only a generic private refusal to the authenticated sender. No group names,
+    // roster, task text, manager report or other employee data escapes the group.
+    await socket.sendMessage(`${body.senderNumber}@s.whatsapp.net`, {
+      text: 'ما قدرت أعالج طلب الجروب بأمان لأن التحقق من صلاحيات جميع أعضائه غير مكتمل. ابعت طلبك هون على الخاص أو راجع باسم.', linkPreview: null,
+    });
+  }
 
   function stop(code) {
     if (stopped) return;
@@ -51,9 +109,9 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       lookupPhoneForLid: jid => current.signalRepository.lidMapping.getPNForLID(jid),
     };
     current.ev.on('groups.update', updates => {
-      for (const update of updates) if (update.id) groupCache.delete(update.id);
+      for (const update of updates) if (update.id) invalidateGroup(update.id);
     });
-    current.ev.on('group-participants.update', update => groupCache.delete(update.id));
+    current.ev.on('group-participants.update', update => invalidateGroup(update.id));
     current.ev.on('creds.update', update => {
       if (stopped || current !== socket) return;
       auth.saveCreds(update).catch(() => stop('auth_persistence_failed'));
@@ -105,8 +163,17 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       incomingChain = incomingChain.then(async () => {
         for (const message of event.messages) {
           if (!ready || stopped || current !== socket) break;
-          const incoming = await selectIncoming(message, event, config, identity, now(), activatedAt);
-          if (incoming && ready && !stopped && current === socket) store.enqueue(incoming);
+          let incoming = await selectIncoming(message, event, config, identity, now(), activatedAt);
+          if (!incoming && transcribeVoice && config.voiceEnabled && message.message?.audioMessage) {
+            try {
+              incoming = await selectVoiceIncoming(message,event,config,identity,now(),activatedAt,{
+                transcribe: transcribeVoice, reserve: body => control?.reserveVoice(body) === true,
+                authorize: async body => ready && !stopped && current === socket && await isActiveNumber(body.senderNumber)
+                  && (body.groupId === null || (await inspectGroup(body.groupId)).allowed),
+              });
+            } catch { output.info('Titanium voice: unavailable_or_rejected. No audio or transcript logged.'); }
+          }
+          if (incoming && await isActiveNumber(incoming.body.senderNumber) && ready && !stopped && current === socket) store.enqueue(incoming);
         }
       }).catch(() => stop('incoming_persistence_failed'));
     });
@@ -132,18 +199,42 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
           return;
         }
       }
+      if (control && await processControlJob({ control,
+        socket: { groupFetchAllParticipating: () => withDeadline(() => socket.groupFetchAllParticipating()) },
+        config, inspectGroup, sendGroup, now })) return;
       if (config.tasksEnabled === false) return;
+      if (secretaryJobs) {
+        const result = await secretaryJobs.deliverNext(async ({ to, text, messageId, signal }) => {
+          if (!ready || stopped || signal?.aborted || typeof messageId !== 'string' ||
+            !/^[a-zA-Z0-9_-]{1,200}$/.test(messageId)) throw new Error('secretary_delivery_unavailable');
+          const reply = boundedPlainText(text);
+          if (!reply) throw new Error('empty_secretary_reply');
+          if (groupJid(to)) { await withAbortSignal(() => sendGroup(to, reply, messageId, signal), signal); return; }
+          const number = typeof to === 'string' ? to.replace(/@s\.whatsapp\.net$/, '') : '';
+          if (!/^[1-9]\d{7,14}$/.test(number) || number === config.botNumber ||
+            !config.allowedNumbers.has(number) || !await isActiveNumber(number) || signal?.aborted) {
+            throw new Error('secretary_recipient_unavailable');
+          }
+          await withAbortSignal(() => socket.sendMessage(`${number}@s.whatsapp.net`, { text: reply, linkPreview: null }, { messageId }), signal);
+        });
+        if (result.status !== 'idle') {
+          output.info(`Titanium secretary delivery: ${result.status === 'sent' ? 'sent' : 'failed'}.`);
+          return;
+        }
+      }
       const row = store.next(now());
       if (!row) return;
       await deliverOne(store, row, config, {
         now, fetcher,
-        sendReply: async (jid, text, messageId) => {
+        authorizeChat: async body => await isActiveNumber(body.senderNumber) &&
+          (body.groupId === null || (await inspectGroup(body.groupId)).allowed),
+        onPrivacyBlocked: privacyRefusal,
+        sendReply: async (jid, text, messageId, body) => {
           if (!ready || stopped) throw new Error('not_connected');
+          if (!await isActiveNumber(body.senderNumber)) throw new Error('sender_disabled');
           if (config.allowedGroups.has(jid)) {
-            const cached = groupCache.get(jid);
-            if (!cached || cached.expires <= now()) {
-              groupCache.set(jid, { metadata: await socket.groupMetadata(jid), expires: now() + 300_000 });
-            }
+            await sendGroup(jid, text, messageId);
+            return;
           }
           await socket.sendMessage(jid, { text, linkPreview: null }, { messageId });
         },

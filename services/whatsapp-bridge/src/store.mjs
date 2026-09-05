@@ -55,8 +55,9 @@ export function openStore(directory) {
       const recent = db.prepare('SELECT count(*) AS count FROM inbox WHERE sender=? AND created_at>?').get(body.senderNumber, body.receivedAt - 60_000).count;
       const pending = db.prepare("SELECT count(*) AS count FROM inbox WHERE state IN ('backend','reply','sending_reply')").get().count;
       if (recent >= 12 || pending >= 1000) return false;
+      const replyId = randomBytes(18).toString('hex').toUpperCase();
       db.prepare('INSERT INTO inbox(id,chat_jid,raw_body,sender,created_at,reply_id) VALUES(?,?,?,?,?,?)')
-        .run(id, chatJid, JSON.stringify(body), body.senderNumber, body.receivedAt, randomBytes(18).toString('hex').toUpperCase());
+        .run(id, chatJid, JSON.stringify({ ...body, responseMessageId: replyId }), body.senderNumber, body.receivedAt, replyId);
       return true;
     },
     next(now) { return db.prepare("SELECT * FROM inbox WHERE state IN ('backend','reply') AND next_at<=? ORDER BY created_at,id LIMIT 1").get(now); },

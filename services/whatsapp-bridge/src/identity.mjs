@@ -60,8 +60,13 @@ export async function selectIncoming(message, event, config, identity, now, acti
   const senderNumber = await resolvePhone(isGroup ? key.participant : chat,
     isGroup ? key.participantAlt : key.remoteJidAlt, identity);
   if (!senderNumber || senderNumber === config.botNumber || !config.allowedNumbers.has(senderNumber)) return null;
+  // A quote is only a reference. Never forward quoted content, names, or identities.
+  const quotedId = content.extendedTextMessage?.contextInfo?.stanzaId;
+  const replyToMessageId = typeof quotedId === 'string' && /^[a-zA-Z0-9_-]{1,200}$/.test(quotedId)
+    ? quotedId : undefined;
   return {
     chatJid: isGroup ? chat : identity.normalizeJid(chat),
-    body: { messageId: key.id, senderNumber, groupId: isGroup ? chat : null, text, receivedAt: now },
+    body: { messageId: key.id, senderNumber, groupId: isGroup ? chat : null, text, receivedAt: now,
+      ...(replyToMessageId ? { replyToMessageId } : {}) },
   };
 }

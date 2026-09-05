@@ -123,6 +123,21 @@ test('OTP service remains enabled when task automation is disabled', () => {
   assert.equal(child.WHATSAPP_LOGIN_ENABLED, '1');
 });
 
+test('secretary settings pass no Groq key and disabled/unverified contacts never enter sender allowlist', () => {
+  const child = bridgeChildEnvironment({ ...settings, SECRETARY_ENABLED: '1', SECRETARY_WEB_ENABLED: '1', SECRETARY_VOICE_ENABLED: '0',
+    WHATSAPP_LOGIN_DATABASE: path.join(os.tmpdir(), 'otp-test.sqlite'), TEAM_CHAT_CONTACTS_JSON: JSON.stringify([
+      { userId: 'member', number: '15551234567', name: 'PRIVATE_NAME' },
+      { userId: 'disabled', number: '15551230000', active: false },
+      { userId: 'unverified', number: '15551239999', verified: false },
+    ]) }, env, false, serviceDirectory);
+  assert.equal(child.SECRETARY_ENABLED, '1');
+  assert.equal(child.SECRETARY_WEB_ENABLED, undefined);
+  assert.equal(child.GROQ_API_KEY, undefined);
+  assert.equal(child.TEAM_CHAT_ALLOWED_NUMBERS, '15551234567');
+  assert.equal(child.TEAM_CHAT_AUTH_DATABASE, path.join(os.tmpdir(), 'otp-test.sqlite'));
+  assert.doesNotMatch(child.TEAM_CHAT_AUTH_CONTACTS_JSON, /PRIVATE_NAME/);
+});
+
 test('disabled website settings exit zero without creating state or a child', async () => {
   const f = fixture({ TEAM_CHAT_ENABLED: '0' });
   assert.equal(await launchPrivate({ ...f.dependencies, args: [] }), 0);

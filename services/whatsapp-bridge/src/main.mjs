@@ -3,6 +3,9 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.mjs';
 import { openStore, createAuthState } from './store.mjs';
 import { createBridgeRuntime } from './runtime.mjs';
+import { createContactAuthorizer } from './group-privacy.mjs';
+import { openControl } from './control.mjs';
+import { createVoiceTranscriber } from './voice.mjs';
 
 async function main() {
   if (process.env.TEAM_CHAT_BRIDGE_ENABLED !== '1') {
@@ -10,12 +13,35 @@ async function main() {
     return;
   }
   const config = loadConfig(process.env, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
-  const { default: makeWASocket, BufferJSON, initAuthCreds, proto, jidNormalizedUser, makeCacheableSignalKeyStore, DisconnectReason } = await import('baileys');
+  const { default: makeWASocket, BufferJSON, initAuthCreds, proto, jidNormalizedUser, makeCacheableSignalKeyStore, DisconnectReason, downloadContentFromMessage } = await import('baileys');
   const { default: pino } = await import('pino');
   const logger = pino({ level: 'silent' });
   process.umask(0o077);
   const store = openStore(config.stateDirectory);
   const auth = createAuthState(store, { BufferJSON, initAuthCreds, proto });
+  const control = openControl(config.stateDirectory);
+  control.recover();
+  let isActiveNumber = () => false;
+  let secretaryJobs;
+  if (process.env.TEAM_CHAT_AUTH_DATABASE) {
+    const { DatabaseSync } = await import('node:sqlite');
+    const { lstatSync, realpathSync } = await import('node:fs');
+    const filename = process.env.TEAM_CHAT_AUTH_DATABASE;
+    if (!path.isAbsolute(filename) || realpathSync(filename) !== filename ||
+      !lstatSync(filename).isFile() || lstatSync(filename).isSymbolicLink()) throw new Error('Invalid authorization database.');
+    const authorizationDb = new DatabaseSync(filename, { readOnly: true });
+    authorizationDb.exec('PRAGMA busy_timeout = 5000;');
+    const contacts = JSON.parse(process.env.TEAM_CHAT_AUTH_CONTACTS_JSON);
+    if (!Array.isArray(contacts)) throw new Error('Invalid authorization contacts.');
+    isActiveNumber = createContactAuthorizer({ db: authorizationDb, contacts: () => contacts });
+    if (process.env.SECRETARY_ENABLED === '1') {
+      const { createSecretaryJobs } = await import('../../../lib/secretary-jobs.ts');
+      const jobsDb = new DatabaseSync(filename);
+      jobsDb.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;');
+      secretaryJobs = createSecretaryJobs({ db: jobsDb, config: { enabled: true,
+        contacts, allowedGroupIds: [...config.allowedGroups] } });
+    }
+  }
   let otpQueue;
   if (['1', 'pilot'].includes(process.env.WHATSAPP_LOGIN_ENABLED)) {
     const { DatabaseSync } = await import('node:sqlite');
@@ -32,6 +58,8 @@ async function main() {
   }
   const runtime = createBridgeRuntime({
     config, store, auth, makeWASocket, jidNormalizedUser, makeCacheableSignalKeyStore, DisconnectReason, logger, otpQueue,
+    control, isActiveNumber, secretaryJobs,
+    ...(config.voiceEnabled ? { transcribeVoice: createVoiceTranscriber({ apiKey: process.env.GROQ_API_KEY, downloadContent: downloadContentFromMessage }) } : {}),
     onStop: code => { process.exitCode = code === 'service_shutdown' ? 0 : 78; },
   });
   process.once('SIGTERM', () => runtime.stop('service_shutdown'));

@@ -128,6 +128,29 @@ test('quoted sender cannot grant authority and source text is not replaced by qu
   assert.equal(selected.body.text, 'بدأت المهمة');
 });
 
+test('only a well-shaped quoted ID crosses signed transport; quoted content never crosses', async () => {
+  const message = msg({ message: { extendedTextMessage: { text: 'أؤكد', contextInfo: {
+    stanzaId: 'WA_QUOTED_123', participant: '15559999999@s.whatsapp.net',
+    quotedMessage: { conversation: 'SYNTHETIC_SECRET_QUOTE' } } } } });
+  const selected = await select(message);
+  assert.equal(selected.body.replyToMessageId, 'WA_QUOTED_123');
+  assert.equal(selected.body.senderNumber, member);
+  assert.equal(JSON.stringify(selected).includes('SYNTHETIC_SECRET'), false);
+  message.message.extendedTextMessage.contextInfo.stanzaId = '<untrusted-ID>';
+  assert.equal((await select(message)).body.replyToMessageId, undefined);
+});
+
+test('group queued work fails closed without a privacy policy before calling backend', async t => {
+  const f = fixture(t);
+  f.store.enqueue({ chatJid: group, body: { messageId: 'GROUP_TEST', senderNumber: member,
+    groupId: group, text: 'تقرير الإدارة', receivedAt: now } });
+  let called = false;
+  await deliverOne(f.store, f.store.next(now), { ...config, allowedGroups: new Set([group]) }, {
+    fetcher: async () => { called = true; }, sendReply: async () => { called = true; } });
+  assert.equal(called, false);
+  assert.equal(f.store.db.prepare('SELECT error_code FROM inbox').get().error_code, 'privacy_check_failed');
+});
+
 test('bare six-digit English/Arabic OTP text is ignored in private and group messages', async () => {
   const cfg = { ...config, allowedGroups: new Set([group]) };
   let mappingCalls = 0;
@@ -161,6 +184,7 @@ test('HMAC uses raw UTF-8 body, hex-decoded secret and millisecond timestamp', (
 test('durable queue preserves body, rejects duplicate IDs, survives restart and reuses reply ID', t => {
   const f = fixture(t);
   const initial = enqueue(f.store);
+  assert.equal(JSON.parse(initial.raw_body).responseMessageId, initial.reply_id);
   assert.equal(f.store.enqueue({ chatJid: initial.chat_jid, body: JSON.parse(initial.raw_body) }), false);
   const restarted = f.restart().next(now);
   assert.equal(restarted.raw_body, initial.raw_body);
@@ -241,7 +265,7 @@ test('backend retries identical body only on network, 429 and 503, then stops', 
   assert.equal(f.store.db.prepare('SELECT state FROM inbox').get().state, 'failed');
 });
 
-test('backend timeout is bounded at 30 seconds and exceeds the 12-second inference budget', async t => {
+test('backend timeout is bounded at 50 seconds and covers planning plus public search', async t => {
   const f = fixture(t);
   const controller = new AbortController();
   const timeout = t.mock.method(AbortSignal, 'timeout', () => controller.signal);
@@ -255,9 +279,9 @@ test('backend timeout is bounded at 30 seconds and exceeds the 12-second inferen
   });
   assert.equal(timeout.mock.calls.length, 1);
   const [deadlineMs] = timeout.mock.calls[0].arguments;
-  assert.equal(deadlineMs, 30_000);
+  assert.equal(deadlineMs, 50_000);
   assert.ok(deadlineMs > 12_000);
-  assert.ok(deadlineMs <= 35_000);
+  assert.ok(deadlineMs <= 55_000);
   assert.equal(suppliedSignal, controller.signal);
   assert.equal(f.store.db.prepare('SELECT state FROM inbox').get().state, 'done');
 });

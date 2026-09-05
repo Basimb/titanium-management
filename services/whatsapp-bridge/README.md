@@ -1,7 +1,7 @@
-# Titanium WhatsApp linked-device bridge — local draft
+# Titanium WhatsApp linked-device bridge
 
-This is an **unpaired, undeployed draft**, disabled by default. It has
-not connected to WhatsApp or changed live tasks. It does not use the browser's
+The bridge is disabled by default in a new installation. Installing an update
+does not pair a new device or activate a group. It does not use the browser's
 WhatsApp session, copy browser credentials, control a browser, or run commands
 from chat messages. The phone remains registered in the normal Business app.
 
@@ -19,7 +19,8 @@ from chat messages. The phone remains registered in the normal Business app.
 - No history/backfill, protocol messages, edits, reactions, forwarded media,
   statuses, broadcasts or own messages. Fresh means after first bridge activation,
   at most five minutes old, with at most one minute of future clock skew.
-  Plain extended text may contain a quote, but only its new text is processed.
+  Plain extended text may contain a quote; only the new text and a validated
+  quoted message ID are forwarded, never the quoted message's contents or sender.
 - Maximum twelve accepted messages per registered sender per minute and 1,000
   pending queue rows. Excess messages are ignored; there is no unlimited queue.
 - Backend POST retries only for transport errors, HTTP 429 or HTTP 503, at most
@@ -35,7 +36,7 @@ from chat messages. The phone remains registered in the normal Business app.
 
 ## Runtime / pairing prerequisites
 
-Use **Node.js 22.23.2+** (this draft uses built-in `node:sqlite`), one persistent process,
+Use **Node.js 22.23.2+** (built-in `node:sqlite`), one persistent process,
 a durable private local filesystem, and outbound HTTPS/WebSocket access. A normal
 serverless request handler or a process tied to this conversation is insufficient.
 The VPS must have a supervisor that starts one instance after reboot. Do not run
@@ -98,7 +99,7 @@ or silently pairs another account.
 Raw UTF-8 JSON body, retaining the same bytes on retries:
 
 ```json
-{"messageId":"WA_MESSAGE_ID","senderNumber":"15551234567","groupId":null,"text":"started the task","receivedAt":1800000000000}
+{"messageId":"WA_MESSAGE_ID","senderNumber":"15551234567","groupId":null,"text":"started the task","receivedAt":1800000000000,"responseMessageId":"PREASSIGNED_OUTGOING_ID","replyToMessageId":"OPTIONAL_QUOTED_ID"}
 ```
 
 The original authenticated group ID replaces null for a group. `receivedAt` is
@@ -117,6 +118,10 @@ mapping and group allowlist; scope durable deduplication by sender, group and
 message ID; reject conflicting reused IDs; and commit task changes plus result
 atomically. Client-side filters are not a replacement for backend authorization.
 The model must never authorize a sender or select arbitrary operations/recipients.
+`responseMessageId` is generated once in the durable inbox, signed and reused on
+every backend retry and eventual send. `replyToMessageId` is optional and only
+references the WhatsApp envelope's quoted stanza ID. The backend must resolve the
+reference within the same authenticated sender/group context; it is not authority.
 
 Success is HTTP 200 with `{status: string, reply: string, taskId?: string}`. Empty
 reply means remain silent. Extra fields are discarded, particularly recipients.
@@ -124,6 +129,107 @@ The reply goes only to the authenticated original chat. Backend-owned templates
 and action policies must ensure a group reply does not disclose other users'
 private task details. HMAC does not make a compromised bridge host trustworthy;
 it authenticates that host, not every possible assertion made by malicious code.
+
+## Secretary groups, privacy and operational controls
+
+`launch-private.mjs` now derives `TEAM_CHAT_AUTH_DATABASE` from the existing private
+`WHATSAPP_LOGIN_DATABASE` setting, and a minimal `TEAM_CHAT_AUTH_CONTACTS_JSON`
+phone/user mapping from administrator-owned contacts. Contact records explicitly
+marked inactive or unverified are excluded from the sender allowlist. Before
+processing or delivering task messages, the bridge checks the website's current
+`users.active = 1` row. Missing/invalid database authorization fails closed without
+altering the separate OTP worker. A contact phone remap or group allowlist change
+still requires a graceful service restart to refresh its startup configuration;
+do not pair again or erase session state. Website user deactivation applies
+immediately without that restart.
+
+Every group needs its exact allowlisted JID. A fresh WhatsApp metadata query runs
+before backend work and again immediately before sending a group reply. Every
+participant must resolve unambiguously to the configured bot or an active mapped
+website user. Unknown/conflicting LIDs, outsiders, duplicate identities, an
+incomplete list, absent bot or an announcement group the bot cannot post to deny
+delivery. A membership-change event during the check invalidates it. A short-lived
+metadata value used for that send's encryption is **not** an authorization cache;
+the previous five-minute authorization/cache path is gone. This is a best-effort
+fresh check, not a transactional guarantee against someone joining WhatsApp in
+the instant between verification and network delivery.
+
+On privacy failure the sensitive request is failed before any group response.
+At most one generic private refusal per sender/group/hour is attempted to the
+same currently authorized sender. It contains no roster, group title or task
+information. An ambiguous refusal send is not retried.
+
+Replies are bounded plain-text cards: maximum 4,000 JavaScript characters and
+16,384 bytes for the whole backend JSON response, no link previews, no arbitrary
+response-selected recipients. Unsafe control/bidi override characters are removed.
+Native interactive buttons are not implemented or represented as supported.
+
+### Private group discovery/status/one-time introduction
+
+After installing this version, restart the existing single supervised service
+once using its existing credentials. Subsequent control requests use the running
+socket, not a second login or a second Baileys process. `control.mjs` opens only
+the separate private `control.sqlite`, not WhatsApp authentication/session data.
+
+Run with the pinned Node executable from a trusted local server terminal:
+
+```text
+node src/control.mjs /absolute/private/existing-state-dir discover "تطوير شركة تيتانيوم"
+node src/control.mjs /absolute/private/existing-state-dir result JOB_UUID
+node src/control.mjs /absolute/private/existing-state-dir status EXACT_GROUP_JID
+node src/control.mjs /absolute/private/existing-state-dir intro EXACT_GROUP_JID
+```
+
+`discover` matches only the exact normalized subject. Its result stores matching
+group IDs, the requested title and safe membership counts/reasons; unrelated group
+names, descriptions and roster numbers are discarded. Multiple exact matches
+require the owner to choose the intended one. Discovery does not enable a group,
+add members, send an introduction or change private configuration. `status` and
+`intro` require an exact allowlisted group. Never infer a group ID from its title.
+
+Each command returns a job ID; fetch its result separately. Jobs expire after
+five minutes, have a 15-second execution deadline and are limited to 20 requests
+per hour with 20 pending jobs. The fixed introductory message is explicitly queued
+and deduplicated per group across process restarts. A failed/ambiguous introduction
+is not automatically retried; inspect delivery before any deliberate remediation.
+No generic arbitrary-message or arbitrary-recipient command is exposed.
+
+### Explicit user-requested reminders
+
+`SECRETARY_ENABLED=1` in protected configuration enables the independent
+`lib/secretary-jobs.ts` worker with the existing website database and sanitized
+contacts/groups. No AI key is passed to this worker. The bridge accepts its
+`deliverNext(send)` interface; recipient authorization and fresh group privacy
+checks still run immediately before send. Its abort signal also bounds a hung
+transport call; a send accepted before timeout can have an uncertain outcome.
+OTP always has queue priority. `TEAM_CHAT_ENABLED=0` pauses secretary/task delivery
+without disabling OTP. The bridge accepts protected `SECRETARY_WEB_ENABLED` and
+`SECRETARY_VOICE_ENABLED` settings for shared-config compatibility, but it does
+not forward web-search configuration into transport. With the owner's explicit
+voice consent, `SECRETARY_ENABLED=1` plus `SECRETARY_VOICE_ENABLED=1` passes the
+Groq key only to the server-side, bounded voice transcriber. Text-only mode and
+OTP alone still receive no Groq key.
+
+## Free-tier web and voice feasibility (not transport activation)
+
+Official Groq documentation lists free-tier Compound/Compound Mini web-capable
+systems and multilingual Whisper models. The exact account quota remains the
+console's authority; hitting a free limit returns HTTP 429, not an instruction to
+add billing or silently fall back to a paid provider. Compound must remain
+separate from the management mutation engine and receive only a public research
+query, not staff/task context. The owner has approved voice processing. The voice
+path accepts only authenticated fresh PTT Ogg/Opus ≤60seconds and ≤2MiB, validates
+the actual container and plaintext hash, uses a pinned WhatsApp CDN with no
+redirects, and enforces one15second download/transcription deadline. Audio remains
+in memory, is never written to a file, and never becomes an executable command:
+the backend requires confirmation for every voice-derived mutation. The private
+control database deduplicates voice requests and limits3/minute per sender and
+12/minute globally. Live account/API/phone tests are still required separately.
+
+- [Groq free-plan limits](https://console.groq.com/docs/rate-limits)
+- [Compound systems and supported built-in tools](https://console.groq.com/docs/compound)
+- [Speech-to-text formats and free upload limits](https://console.groq.com/docs/speech-to-text)
+- [Groq billing FAQs](https://console.groq.com/docs/billing-faqs)
 
 ## Verification and limitations
 

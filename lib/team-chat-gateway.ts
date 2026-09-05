@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { inferWhatsAppIntent, type IntentInput, type ParsedIntent } from "./whatsapp-intent.ts";
 import { normalizeContactNumber, type ChatContact } from "./team-chat-policy.ts";
 import { applyTeamChatIntent, getTeamChatCatalog, lookupTeamChatEvent, migrateTeamChatStore } from "./team-chat-store.ts";
+import { resolveChatUser, type ChatUser } from "./team-chat-policy.ts";
 
 export type TeamChatConfig = {
   enabled: boolean;
@@ -76,12 +77,17 @@ export type TeamChatEnvelope = {
   groupId: string | null;
   text: string;
   receivedAt: number;
+  replyToMessageId?: string | null;
+  responseMessageId?: string | null;
+  inputKind?: "text" | "voice";
 };
 
 function envelope(value: unknown): TeamChatEnvelope | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
-  if (Object.keys(v).sort().join(",") !== "groupId,messageId,receivedAt,senderNumber,text"
+  if (Object.keys(v).some(key => !["groupId", "messageId", "receivedAt", "senderNumber", "text", "replyToMessageId", "responseMessageId", "inputKind"].includes(key))
+    || (v.inputKind !== undefined && v.inputKind !== "text" && v.inputKind !== "voice")
+    || ["replyToMessageId", "responseMessageId"].some(key => v[key] != null && (typeof v[key] !== "string" || !/^[A-Za-z0-9._:@-]{1,160}$/.test(v[key] as string)))
     || typeof v.messageId !== "string" || !/^[A-Za-z0-9._:@-]{1,160}$/.test(v.messageId)
     || typeof v.senderNumber !== "string" || !/^[1-9]\d{7,14}$/.test(v.senderNumber)
     || !(v.groupId === null || (typeof v.groupId === "string" && /^\d+(?:-\d+)?@g\.us$/.test(v.groupId)))
@@ -106,6 +112,7 @@ export async function handleTeamChatRequest(request: Request, dependencies: {
   getDatabase: () => DatabaseSync;
   infer?: (input: IntentInput) => Promise<ParsedIntent>;
   now?: () => number;
+  secretary?: (database: DatabaseSync, event: TeamChatEnvelope, config: TeamChatConfig) => Promise<{ status: string; reply: string; taskId?: string }>;
 }): Promise<Response> {
   const { config } = dependencies;
   if (!config.enabled) return response({ error: "Team chat is not enabled." }, 503);
@@ -121,6 +128,14 @@ export async function handleTeamChatRequest(request: Request, dependencies: {
   const origin = { senderNumber: event.senderNumber, groupId: event.groupId };
   try {
     const sqlite = dependencies.getDatabase();
+    if (dependencies.secretary) {
+      const actor = resolveChatUser(origin, config.contacts, sqlite.prepare("SELECT id,name,role,active FROM users").all() as ChatUser[], config.allowedGroupIds);
+      if (!actor) return response({ status: "denied", reply: "" }, 403);
+      if (event.receivedAt > now + 60_000 || now - event.receivedAt > MAX_MESSAGE_AGE) return response({ error: "Message is too old or has invalid time." }, 400);
+      if (!allowedQuota(actor.id, now)) return response({ error: "Please retry shortly." }, 429);
+      const result = await dependencies.secretary(sqlite, event, config);
+      return response(result, result.status === "denied" && !result.reply ? 403 : 200);
+    }
     migrateTeamChatStore(sqlite);
     const eventKey = { messageId: event.messageId, origin, text: event.text };
     const previous = lookupTeamChatEvent(sqlite, eventKey, config);
