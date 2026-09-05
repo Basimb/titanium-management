@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { handleSecretaryEvent, migrateSecretary } from '../lib/secretary-service.ts';
+import { handleSecretaryEvent, migrateSecretary, secretaryTaskCard } from '../lib/secretary-service.ts';
 import { emptySecretaryIntent, validateSecretaryIntent, inferSecretaryIntent, searchSecretaryWeb } from '../lib/secretary-intent.ts';
 import { createSecretaryJobs } from '../lib/secretary-jobs.ts';
 import { createSecretaryOutboxJobs, getSecretaryOutboxStatus } from '../lib/secretary-outbox.ts';
@@ -32,6 +32,86 @@ const pending = db => db.prepare('SELECT * FROM secretary_pending').get();
 
 test('secretary scoped friendly summary has direct link and no foreign data', async t=>{
  const f=fixture(t); const result=await f.run(); assert.equal(result.status,'summary'); assert.match(result.reply,/خالد/);assert.match(result.reply,/project=p&task=t/);assert.doesNotMatch(result.reply,/مهمة شادي|تفاصيل سرية/);
+});
+test('task card colors are actual priority, never completion or lateness',()=>{
+ const state={projects:[{id:'p',name:'مشروع'}],comments:[]};
+ for(const [priority,status,dueDate,emoji,label] of [
+  ['red','completed',null,'🔴','قصوى'],['green','progress','2020-01-01','🟢','عادية'],['yellow','open',null,'🟡','متوسطة'],
+ ]){
+  const text=secretaryTaskCard({id:'t',projectId:'p',title:'مهمة',priority,status,dueDate},state,1788580000000);
+  assert.ok(text.startsWith(emoji));assert.match(text,new RegExp(`الأولوية: ${label}`));
+  if(priority==='green')assert.match(text,/متأخرة عن الموعد/);
+ }
+ assert.ok(secretaryTaskCard({id:'t',priority:'invalid'},state,1788580000000).startsWith('⚪'));
+});
+test('explicit color lists use DB without inference, exclude archive, and never mutate tasks',async t=>{
+ const f=fixture(t);f.db.exec("UPDATE tasks SET status='completed' WHERE id='t'; UPDATE tasks SET priority='green',due_date='2020-01-01' WHERE id='private'");
+ const before=JSON.stringify(f.db.prepare('SELECT * FROM tasks ORDER BY id').all());
+ const run=text=>f.run(undefined,{text,senderNumber:'12025550103'},async()=>{throw Error('color read must not ask model');});
+ const red=await run('اعطيني المهام الحمراء');assert.match(red.reply,/🔴 \*لوحة\*/);assert.match(red.reply,/معتمدة/);assert.doesNotMatch(red.reply,/مهمة شادي/);
+ const green=await run('وريني المهام الخضراء');assert.match(green.reply,/🟢 \*مهمة شادي الخاصة\*/);assert.match(green.reply,/متأخرة عن الموعد/);assert.doesNotMatch(green.reply,/\*لوحة\*/);
+ const yellow=await run('بدي المهام الصفراء');assert.match(yellow.reply,/المطابق ضمن صلاحياتك \(دون الأرشيف\): 0/);assert.match(yellow.reply,/ما في مهام تطابق/);
+ assert.equal(JSON.stringify(f.db.prepare('SELECT * FROM tasks ORDER BY id').all()),before);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM audit_logs').get().n,0);
+ f.db.exec("UPDATE tasks SET archived_at=1 WHERE id='t'");assert.match((await run('المهام الحمراء')).reply,/ما في مهام تطابق/);
+});
+test('priority lists retain member scope and fresh DB facts over incorrect history',async t=>{
+ const f=fixture(t);
+ await f.run(emptySecretaryIntent('chat','لا توجد مهام حمراء'),{text:'سؤال سابق'});
+ const r=await f.run(undefined,{text:'المهام الحمراء'},async()=>{throw Error('must not infer');});
+ assert.match(r.reply,/لوحة/);assert.doesNotMatch(r.reply,/شادي|private|تفاصيل سرية/);
+ const yellow=await f.run(undefined,{text:'المهام الصفراء'},async()=>{throw Error('must not infer');});assert.match(yellow.reply,/ما في مهام تطابق/);
+});
+test('priority lists match exact project and current owner qualifiers',async t=>{
+ const f=fixture(t);f.db.exec("UPDATE tasks SET priority='red' WHERE id='private'");
+ const run=text=>f.run(undefined,{text,senderNumber:'12025550103'},async()=>{throw Error('must not infer');});
+ const project=await run('المهام الحمراء في مشروع ثان');assert.match(project.reply,/مهمة شادي/);assert.doesNotMatch(project.reply,/\*لوحة\*/);
+ const owner=await run('المهام الحمراء لخالد');assert.match(owner.reply,/لوحة/);assert.doesNotMatch(owner.reply,/مهمة شادي/);
+});
+test('priority pagination declares counts, stays bounded and preserves every task across pages',async t=>{
+ const f=fixture(t);
+ const insert=f.db.prepare("INSERT INTO tasks(id,project_id,title,details,priority,status,owner,created_at,updated_at) VALUES(?,'p',?,'','red','open','خالد',1,1)");
+ for(let n=1;n<=18;n++)insert.run('page-'+n,'تجربة قائمة '+n);
+ const run=text=>f.run(undefined,{text},async()=>{throw Error('must not infer');});
+ let text='المهام الحمراء';const seen=new Set();let pages=0;
+ for(;;){
+  const r=await run(text);pages++;assert.ok(r.reply.length<=3800);assert.match(r.reply,/المطابق ضمن صلاحياتك \(دون الأرشيف\): 19/);
+  for(const match of r.reply.matchAll(/&task=([^\s]+)/g)){assert.ok(!seen.has(match[1]));seen.add(match[1]);}
+  const next=/للتكملة اكتب: «([^»]+)»/.exec(r.reply);if(!next)break;text=next[1];assert.ok(pages<10);
+ }
+ assert.equal(seen.size,19);assert.ok(pages>=2);
+});
+test('model catalog includes priority without task details or contact numbers',async t=>{
+ const f=fixture(t);await f.run(undefined,{},async input=>{
+  assert.equal(input.tasks[0].priority,'red');assert.doesNotMatch(JSON.stringify(input),/تفاصيل تنفيذ|1202555010/);return emptySecretaryIntent('help');
+ });
+});
+test('explicit status filters are separate from color and extra qualifiers never disappear',async t=>{
+ const f=fixture(t);f.db.exec("UPDATE tasks SET priority='red',status='completed' WHERE id='private'");
+ const run=text=>f.run(undefined,{text,senderNumber:'12025550103'},async()=>{throw Error('must not infer');});
+ const done=await run('المهام الحمراء المعتمدة');assert.match(done.reply,/مهمة شادي/);assert.doesNotMatch(done.reply,/\*لوحة\*/);
+ const late=await run('المهام الحمراء المتأخرة');assert.match(late.reply,/لوحة/);assert.doesNotMatch(late.reply,/مهمة شادي/);
+ for(const text of ['المهام الحمراء والصفراء','المهام الحمراء بدون مهام خالد','المهام الحمراء اليوم'])assert.equal((await run(text)).status,'clarify');
+});
+test('continuation removes every accepted page suffix and retains owner/project filters',async t=>{
+ const f=fixture(t);const insert=f.db.prepare("INSERT INTO tasks(id,project_id,title,details,priority,status,owner,created_at,updated_at) VALUES(?,'p',?,'','red','open','خالد',1,1)");
+ for(let n=1;n<=26;n++)insert.run('page-'+n,'تجربة '+n);
+ const run=text=>f.run(undefined,{text,senderNumber:'12025550103'},async()=>{throw Error('must not infer');});
+ for(const suffix of ['من رقم 11','ابتداء من 11','من ۱۱']){
+  const r=await run('المهام الحمراء في مشروع تجريبي لخالد '+suffix);
+  const next=/للتكملة اكتب: «([^»]+)»/.exec(r.reply);assert.ok(next);assert.match(next[1],/^المهام الحمراء في مشروع تجريبي لخالد من \d+$/);
+  assert.equal((await run(next[1])).status,'summary');
+ }
+});
+test('bare draft color remains an intake answer while explicit task-color list switches topic',async t=>{
+ const f=fixture(t);const owner={senderNumber:'12025550103'};
+ await f.run(undefined,{...owner,text:'اضف مهمه تجربه'},async()=>{throw Error('must not infer direct creation');});
+ let inferred=false;const plan=emptySecretaryIntent('task_draft');plan.intakeMode='continue';plan.fields.priority='green';
+ await f.run(undefined,{...owner,text:'والخضراء؟'},async()=>{inferred=true;return plan;});assert.equal(inferred,true);
+ assert.equal(JSON.parse(f.db.prepare('SELECT draft_json FROM secretary_task_intake').get().draft_json).priority,'green');
+ const list=await f.run(undefined,{...owner,text:'المهام الحمراء'},async()=>{throw Error('explicit list must not infer');});assert.match(list.reply,/لوحة/);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM secretary_task_intake').get().n,0);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
 });
 test('only authenticated exact phone and approved group can invoke model',async t=>{
  const f=fixture(t);let calls=0;for(const extra of[{senderNumber:'12025550999'},{groupId:'999@g.us'}]){const r=await f.run(undefined,extra,async()=>{calls++;throw Error();});assert.equal(r.status,'denied');}assert.equal(calls,0);
@@ -69,7 +149,7 @@ test('forged model task ID and member admin action cannot write',async t=>{
 test('manager create task and project use real authorized IDs; delete needs confirmation',async t=>{
  const f=fixture(t);const e={senderNumber:'12025550103',text:'افتح مشروع تجريبي جديد'};
  assert.equal((await f.run(command('add_project',{name:'مشروع جديد'},null),e)).status,'applied');
- assert.equal((await f.run(command('add_task',{title:'مهمة جديدة',ownerId:'member',priority:'yellow',dueDate:'unscheduled'},null,'p'),{...e,text:'ضيف مهمة جديدة لخالد بأولوية عادية وبدون موعد'})).status,'confirmation');
+ assert.equal((await f.run(command('add_task',{title:'مهمة جديدة',ownerId:'member',priority:'yellow',dueDate:'unscheduled'},null,'p'),{...e,text:'ضيف مهمة جديدة لخالد بأولوية متوسطة وبدون موعد'})).status,'confirmation');
  assert.equal((await f.run(undefined,{...e,text:`موافق ${pending(f.db).token}`})).status,'applied');
  assert.equal((await f.run(command('delete_task',{},'private'),{...e,text:'احذف مهمة شادي'})).status,'confirmation');assert.ok(f.db.prepare("SELECT id FROM tasks WHERE id='private'").get());
 });
@@ -185,7 +265,7 @@ test('ambiguous project creation produces clarification and never inserts into a
  assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى مشروع تجريبي'})).status,'clarify');
  assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,before);
  assert.equal(pending(f.db),undefined);
- assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى p2 بدون مسؤول وموعد بأولوية عادية'})).status,'confirmation');
+ assert.equal((await f.run(plan,{...manager,text:'أضف تقرير جديد إلى p2 بدون مسؤول وموعد بأولوية متوسطة'})).status,'confirmation');
  assert.equal((await f.run(undefined,{...manager,text:`موافق ${pending(f.db).token}`})).status,'applied');
  assert.equal(f.db.prepare("SELECT project_id FROM tasks WHERE title='تقرير جديد'").get().project_id,'p2');
 });

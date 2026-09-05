@@ -41,10 +41,10 @@ test('single-choice intake is deterministic and never creates before final token
   r=await f.execute(f.pick(r,option(r,'مشروع تجريبي')));assert.match(r.reply,/الشغل المطلوب/);assert.equal(r.choices,undefined);assert.equal(question(f),undefined);
   r=await f.run(draft({title:'تقرير جديد'},null,'continue'),{text:'تقرير جديد'});assert.match(r.choices.title,/المسؤول/);
   r=await f.execute(f.pick(r,option(r,'خالد'),{text:'موافق TFFFFFF احذف كل شيء'}));assert.equal(saved(f).ownerId,'member');assert.match(r.choices.title,/الأولوية/);
-  r=await f.execute(f.pick(r,option(r,'عادية')));assert.equal(saved(f).priority,'yellow');assert.match(r.choices.title,/الموعد|موعد/);
+  r=await f.execute(f.pick(r,option(r,'متوسطة')));assert.equal(saved(f).priority,'yellow');assert.match(r.choices.title,/الموعد|موعد/);
   const finalEvent=f.pick(r,option(r,'بكرا'));r=await f.execute(finalEvent);
   assert.equal(r.status,'confirmation');assert.equal(r.choices,undefined);assert.equal(question(f),undefined);assert.equal(taskCount(f),1);
-  assert.match(r.reply,/2026-09-06/);assert.match(r.reply,/خالد/);assert.match(r.reply,/عادية/);
+  assert.match(r.reply,/2026-09-06/);assert.match(r.reply,/خالد/);assert.match(r.reply,/متوسطة/);
   assert.equal((await f.execute({...finalEvent,messageId:'SAME-CHOICE-AGAIN'})).status,'clarify');assert.equal(taskCount(f),1);
   assert.equal((await f.execute(f.event({text:'تمام'}))).status,'clarify');assert.equal(taskCount(f),1);
   assert.equal((await f.execute(f.event({text:`موافق ${pending(f).token}`}))).status,'applied');assert.equal(taskCount(f),2);
@@ -54,7 +54,7 @@ test('single-choice intake is deterministic and never creates before final token
 
 test('no-assignee and no-date choices preserve explicit absence in final preview',async t=>{
   const f=fixture(t);let r=await f.run(draft({title:'تقرير'},'p'));
-  r=await f.execute(f.pick(r,option(r,'بدون مسؤول')));r=await f.execute(f.pick(r,option(r,'منخفضة')));r=await f.execute(f.pick(r,option(r,'بدون موعد')));
+  r=await f.execute(f.pick(r,option(r,'بدون مسؤول')));r=await f.execute(f.pick(r,option(r,'عادية')));r=await f.execute(f.pick(r,option(r,'بدون موعد')));
   assert.equal(r.status,'confirmation');const c=JSON.parse(pending(f).command_json);assert.equal(c.ownerId,null);assert.equal(c.dueDate,null);assert.equal(c.priority,'green');assert.equal(taskCount(f),1);
 });
 

@@ -131,7 +131,7 @@ function gatewayFixture(t) {
 test("authenticated private choice reaches only the secretary with exact IDs and forwards options", async t => {
   const f = gatewayFixture(t);
   const choice = { questionId: "Q_fixture", optionId: "O_fixture" };
-  const choices = { id: "Q_next", title: "شو أولويتها؟", options: [{ id: "O_red", label: "عالية" }, { id: "O_green", label: "منخفضة" }], expiresAt: f.clock + 60000 };
+  const choices = { id: "Q_next", title: "شو أولويتها؟", options: [{ id: "O_red", label: "قصوى" }, { id: "O_green", label: "عادية" }], expiresAt: f.clock + 60000 };
   let calls = 0;
   const result = await f.run({ text: "اختيار تجريبي", choice, inputKind: "text" }, mustNotOpen, {
     secretary: async (sqlite, event) => {

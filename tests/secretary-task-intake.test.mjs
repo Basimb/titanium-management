@@ -42,11 +42,11 @@ test('intake asks one missing field at a time and preserves omitted known answer
   assert.match((await f.run(draft({ownerId:'member'},null,'continue'),{text:'لخالد'},async value=>{input=value;return draft({ownerId:'member'},null,'continue');})).reply,/أولويتها/);
   assert.equal(input.taskDraft.projectId,'p');assert.equal(input.taskDraft.title,complete.title);
   assert.doesNotMatch(JSON.stringify(input),/1202555|pin_hash/);
-  assert.match((await f.run(draft({priority:'yellow'},null,'continue'),{text:'أصفر عادية'})).reply,/شو موعدها/);
+  assert.match((await f.run(draft({priority:'yellow'},null,'continue'),{text:'أصفر متوسطة'})).reply,/شو موعدها/);
   assert.equal(saved(f).priority,'yellow');assert.equal(tasks(f).length,1);
   const preview=await f.run(draft({dueDate:'2026-09-12'},null,'continue'),{text:'12 سبتمبر 2026'});
   assert.equal(preview.status,'confirmation');assert.equal(intake(f),undefined);assert.equal(tasks(f).length,1);
-  for(const known of ['مشروع تجريبي',complete.title,'خالد','عادية','2026-09-12','مفتوحة'])assert.ok(preview.reply.includes(known));
+  for(const known of ['مشروع تجريبي',complete.title,'خالد','متوسطة','2026-09-12','مفتوحة'])assert.ok(preview.reply.includes(known));
   await f.run(undefined,{text:`موافق ${pending(f).token}`});
   const task=tasks(f).find(row=>row.id!=='existing');
   assert.equal(task.project_id,'p');assert.equal(task.title,complete.title);assert.equal(task.priority,'yellow');assert.equal(task.suggested_owner,'خالد');assert.equal(task.status,'open');
@@ -64,7 +64,7 @@ test('explicit no assignee and no deadline map to null without guessing priority
   const f=fixture(t);await f.run(draft({title:complete.title,ownerId:'unassigned',dueDate:'unscheduled'},'p'));
   assert.equal(saved(f).priority,null);assert.equal(pending(f),undefined);
   const preview=await f.run(draft({priority:'green'},null,'continue'),{text:'منخفضة'});
-  assert.match(preview.reply,/بدون مسؤول حاليًا/);assert.match(preview.reply,/بدون موعد/);assert.match(preview.reply,/منخفضة/);
+  assert.match(preview.reply,/بدون مسؤول حاليًا/);assert.match(preview.reply,/بدون موعد/);assert.match(preview.reply,/عادية/);
   const c=JSON.parse(pending(f).command_json);assert.equal(c.ownerId,null);assert.equal(c.dueDate,null);
   await f.run(undefined,{text:pending(f).token});const task=tasks(f).find(row=>row.id!=='existing');
   assert.equal(task.suggested_owner,null);assert.equal(task.due_date,null);assert.equal(task.priority,'green');assert.equal(task.status,'open');
@@ -79,7 +79,7 @@ test('starting a different task does not inherit the previous draft fields',asyn
 test('corrections overwrite only supplied fields and optional details never add a question',async t=>{
   const f=fixture(t);await f.run(draft({title:complete.title,ownerId:'member',priority:'red'},'p'));
   const result=await f.run(draft({ownerId:'other',priority:'green',dueDate:'unscheduled'},null,'continue'),{text:'لا لشادي وخليها منخفضة بدون موعد'});
-  assert.equal(result.status,'confirmation');assert.match(result.reply,/شادي/);assert.match(result.reply,/منخفضة/);
+  assert.equal(result.status,'confirmation');assert.match(result.reply,/شادي/);assert.match(result.reply,/عادية/);
   const c=JSON.parse(pending(f).command_json);assert.equal(c.ownerId,'other');assert.equal(c.priority,'green');assert.equal(c.projectId,'p');assert.equal(c.title,complete.title);
 });
 
@@ -96,7 +96,7 @@ test('correction after a complete preview preserves every known field and replac
 test('late correction to an older completed preview cannot replace a newer confirmation',async t=>{
   const f=fixture(t);await f.run(draft(complete,'p'));
   let resolve,entered;const ready=new Promise(r=>{entered=r;});
-  const old=f.execute(f.event({text:'خلّي الأولوية عادية'}),async()=>{entered();return await new Promise(r=>{resolve=r;});});await ready;
+  const old=f.execute(f.event({text:'خلّي الأولوية متوسطة'}),async()=>{entered();return await new Promise(r=>{resolve=r;});});await ready;
   await f.run(draft({priority:'green'},null,'continue'),{text:'خليها منخفضة'});const current=pending(f).token;
   resolve(draft({priority:'yellow'},null,'continue'));assert.equal((await old).status,'stale');
   assert.equal(pending(f).token,current);assert.equal(JSON.parse(pending(f).command_json).priority,'green');assert.equal(tasks(f).length,1);

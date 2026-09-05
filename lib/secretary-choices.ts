@@ -52,7 +52,7 @@ export function secretaryChoiceOptions(field: SecretaryChoiceField, catalog: {
   if (field === "projectId") return [...names(catalog.projects).slice(0, 11), ...(catalog.projects.length > 11 ? [{ label: "اكتب اسم مشروع آخر", value: null }] : [])];
   if (field === "ownerId") return [...names(catalog.users).slice(0, catalog.users.length > 11 ? 10 : 11),
     { label: "بدون مسؤول حاليًا", value: "unassigned" }, ...(catalog.users.length > 11 ? [{ label: "اكتب اسم موظف آخر", value: null }] : [])];
-  if (field === "priority") return [{ label: "🔴 عالية", value: "red" }, { label: "🟡 عادية", value: "yellow" }, { label: "🟢 منخفضة", value: "green" }];
+  if (field === "priority") return [{ label: "🔴 قصوى", value: "red" }, { label: "🟡 متوسطة", value: "yellow" }, { label: "🟢 عادية", value: "green" }];
   const date = (at: number) => {
     const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Amman", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(at);
     return ["year", "month", "day"].map(type => parts.find(part => part.type === type)!.value).join("-");

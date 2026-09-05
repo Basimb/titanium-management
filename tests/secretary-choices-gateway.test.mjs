@@ -34,7 +34,7 @@ function setup(t) {
 test('signed choice traverses gateway into deterministic intake, never creates before preview confirmation',async t=>{
   const f=setup(t);const empty=emptySecretaryIntent('task_draft');
   const start=await f.send({},()=>({...empty,intakeMode:'start',projectId:'p',fields:{...empty.fields,title:'تقرير تجريبي',ownerId:'unassigned'}}));
-  assert.ok(start.choices);const green=start.choices.options.find(o=>/منخفضة/.test(o.label));assert.ok(green);
+  assert.ok(start.choices);const green=start.choices.options.find(o=>/عادية/.test(o.label));assert.ok(green);
   const dateQuestion=await f.send({text:green.label,choice:{questionId:start.choices.id,optionId:green.id}});
   assert.ok(dateQuestion.choices);const noDate=dateQuestion.choices.options.find(o=>/بدون موعد/.test(o.label));assert.ok(noDate);
   const preview=await f.send({text:noDate.label,choice:{questionId:dateQuestion.choices.id,optionId:noDate.id}});

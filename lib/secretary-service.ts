@@ -3,7 +3,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { executeManagementAction, getManagementSnapshot, migrateManagementActions, ManagementActionError, type ManagementCommand } from "./management-actions.ts";
 import { resolveChatUser, normalizeContactNumber, type ChatUser } from "./team-chat-policy.ts";
 import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
-import { directTaskCreationIntent, validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
+import { directTaskCreationIntent, emptySecretaryIntent, validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
+import { priorityTaskQuery, type PriorityTaskQuery } from "./secretary-priority-query.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
 import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, SecretaryOutboxError } from "./secretary-outbox.ts";
 import { migrateSecretaryChoices, createSecretaryChoices, consumeSecretaryChoice, clearSecretaryChoices, secretaryChoiceOptions, SecretaryChoiceError, type SecretaryChoices, type SecretaryChoiceField } from "./secretary-choices.ts";
@@ -87,11 +88,42 @@ function log(db: DatabaseSync, actor: ChatUser, event: Event, action: string, de
     .run(actor.id, actor.name, action, eventKey(event), JSON.stringify({ summary: "محادثة سكرتير الإدارة", source: "whatsapp_secretary", sourceMessageId: event.messageId, senderNumber: event.senderNumber, originalText: event.text, ...details }), now);
 }
 function taskLink(task: Task) { return `${ORIGIN}/?project=${encodeURIComponent(task.projectId)}&task=${encodeURIComponent(task.id)}`; }
-function icon(task: Task, now: number) { return task.status === "completed" ? "🟢" : task.dueDate && task.dueDate < new Date(now + 3 * 3600_000).toISOString().slice(0, 10) ? "🔴" : "🟡"; }
+const PRIORITIES: Record<string, { icon: string; label: string; color: string }> = {
+  red: { icon: "🔴", label: "قصوى", color: "الحمراء" },
+  yellow: { icon: "🟡", label: "متوسطة", color: "الصفراء" },
+  green: { icon: "🟢", label: "عادية", color: "الخضراء" },
+};
 export function secretaryTaskCard(task: Task, state: Snapshot, now: number, detailed = false) {
   const project = state.projects.find(p => p.id === task.projectId);
   const latest = state.comments.filter(c => c.taskId === task.id).sort((a, b) => b.createdAt - a.createdAt)[0];
-  return `${icon(task, now)} *${clean(task.title, 150)}*\n${clean(project?.name, 90)} • ${LABELS[task.status] || clean(task.status)}\nالمسؤول: ${clean(task.owner || task.suggestedOwner || "لم يُعيّن")} ${task.dueDate ? `• الموعد: ${clean(task.dueDate, 10)}` : ""}${detailed ? `\nالمطلوب: ${clean(task.details || "لا توجد تفاصيل إضافية", 600)}\nالأولوية: ${{ red: "عالية", yellow: "عادية", green: "منخفضة" }[task.priority] || "عادية"}${latest ? `\nآخر تحديث (${clean(latest.author, 50)}): ${clean(latest.body, 500)}` : "\nلا يوجد تحديث مسجّل بعد."}` : ""}\n${taskLink(task)}`;
+  const priority = PRIORITIES[task.priority];
+  const overdue = task.status !== "completed" && task.dueDate && task.dueDate < new Date(now + 3 * 3600_000).toISOString().slice(0, 10);
+  return `${priority?.icon || "⚪"} *${clean(task.title, 150)}*\n${clean(project?.name, 90)} • ${LABELS[task.status] || clean(task.status)}${overdue ? " • متأخرة عن الموعد" : ""}\nالأولوية: ${priority?.label || "غير محددة"}\nالمسؤول: ${clean(task.owner || task.suggestedOwner || "لم يُعيّن")} ${task.dueDate ? `• الموعد: ${clean(task.dueDate, 10)}` : ""}${detailed ? `\nالمطلوب: ${clean(task.details || "لا توجد تفاصيل إضافية", 600)}${latest ? `\nآخر تحديث (${clean(latest.author, 50)}): ${clean(latest.body, 500)}` : "\nلا يوجد تحديث مسجّل بعد."}` : ""}\n${taskLink(task)}`;
+}
+function priorityReadReply(query: Extract<PriorityTaskQuery, { kind: "query" }>, state: Snapshot, now: number, text: string): { result: Result; scope: string[] } {
+  const priority = PRIORITIES[query.priority];
+  const today = new Date(now + 3 * 3600_000).toISOString().slice(0, 10);
+  const owner = query.ownerId ? state.users.find(u => u.id === query.ownerId) : null;
+  const tasks = state.tasks.filter(t => !t.archivedAt && t.priority === query.priority
+    && (!query.projectId || t.projectId === query.projectId)
+    && (!query.ownerId || !!owner && (t.owner || t.suggestedOwner) === owner.name)
+    && (!query.status || (query.status === "overdue" ? t.status !== "completed" && !!t.dueDate && t.dueDate < today : t.status === query.status)))
+    .sort((a, b) => a.projectId.localeCompare(b.projectId) || a.id.localeCompare(b.id, "en", { numeric: true }));
+  const project = state.projects.find(p => p.id === query.projectId);
+  const header = `${priority.icon} *المهام ${priority.color} — أولوية ${priority.label}*${project ? `\nالمشروع: ${clean(project.name, 100)}` : ""}${owner ? `\nالمسؤول: ${clean(owner.name, 60)}` : ""}${query.status ? `\nالحالة: ${query.status === "overdue" ? "متأخرة عن الموعد" : LABELS[query.status]}` : ""}\nالمطابق ضمن صلاحياتك (دون الأرشيف): ${tasks.length}\nاللون للأولوية؛ حالة التنفيذ مذكورة لكل مهمة.\n`;
+  const offset = query.offset || 0;
+  const cards: string[] = [];
+  for (const task of tasks.slice(offset, offset + 10)) {
+    const card = `${offset + cards.length + 1}. ${secretaryTaskCard(task, state, now)}`;
+    if ((header + cards.join("\n\n") + card).length > 3150) break;
+    cards.push(card);
+  }
+  const next = offset + cards.length;
+  const continuation = text.trim().replace(/\s+(?:ابتداء\s+)?من\s+(?:رقم\s+)?[0-9٠-٩۰-۹]+[.!؟?\s]*$/u, "").replace(/[.!؟?]+$/u, "");
+  const footer = !tasks.length ? "\nما في مهام تطابق هذا الطلب حاليًا."
+    : !cards.length ? `\nالقائمة فيها ${tasks.length} مهام فقط. ابدأ من 1.`
+    : `\n\nعرض ${offset + 1}–${next} من ${tasks.length}.${next < tasks.length ? ` للتكملة اكتب: «${clean(continuation, 260)} من ${next + 1}».` : ""}`;
+  return { result: { status: "summary", reply: header + "\n" + cards.join("\n\n") + footer }, scope: [...tasks.map(t => "t:" + t.id), ...(project ? ["p:" + project.id] : [])] };
 }
 function readReply(plan: SecretaryIntent, actor: ChatUser, state: Snapshot, now: number): { result: Result; scope: string[] } {
   const greeting = `أهلًا يا ${clean(actor.name, 60)}، `;
@@ -107,7 +139,7 @@ function readReply(plan: SecretaryIntent, actor: ChatUser, state: Snapshot, now:
   const today = new Date(now + 3 * 3600_000).toISOString().slice(0, 10);
   const overdue = tasks.filter(t => t.status !== "completed" && t.dueDate && t.dueDate < today);
   const pending = tasks.filter(t => t.status === "approval");
-  const header = plan.kind === "report" ? `📋 *ملخص الإدارة*\nالمشاريع: ${state.projects.length}\n🟢 معتمدة: ${tasks.filter(t => t.status === "completed").length}\n🟡 قيد التنفيذ: ${tasks.filter(t => t.status === "progress").length}\nبانتظار باسم: ${pending.length}\n🔴 متأخرة بموعد مسجل: ${overdue.length}\nبدون موعد: ${tasks.filter(t => !t.dueDate && t.status !== "completed").length}\n` : `${greeting}المهام المتاحة إلك: ${tasks.length}\n`;
+  const header = plan.kind === "report" ? `📋 *ملخص الإدارة*\nالمشاريع: ${state.projects.length}\nمعتمدة: ${tasks.filter(t => t.status === "completed").length}\nقيد التنفيذ: ${tasks.filter(t => t.status === "progress").length}\nبانتظار باسم: ${pending.length}\nمتأخرة بموعد مسجل: ${overdue.length}\nبدون موعد: ${tasks.filter(t => !t.dueDate && t.status !== "completed").length}\n🔴 قصوى: ${tasks.filter(t => t.priority === "red").length} • 🟡 متوسطة: ${tasks.filter(t => t.priority === "yellow").length} • 🟢 عادية: ${tasks.filter(t => t.priority === "green").length}\n` : `${greeting}المهام المتاحة إلك: ${tasks.length}\n`;
   const ordered = [...tasks].sort((a, b) => Number(overdue.includes(b)) - Number(overdue.includes(a)) || Number(pending.includes(b)) - Number(pending.includes(a)));
   return { result: { status: "summary", reply: `${header}\n${ordered.slice(0, 6).map(t => secretaryTaskCard(t, state, now)).join("\n\n")}${tasks.length > 6 ? `\n\nبقية المهام: ${ORIGIN}/\nحدد مشروعًا أو مهمة لأعرض التفاصيل.` : ""}${tasks.length === 0 ? "ما في مهام متاحة إلك حاليًا." : ""}` }, scope: tasks.map(t => "t:" + t.id) };
 }
@@ -131,7 +163,7 @@ function commandDescription(command: Record<string, unknown>, state: Snapshot) {
     command.title ? `العنوان: ${clean(command.title)}` : null, command.name ? `الاسم: ${clean(command.name)}` : null,
     command.details ? `التفاصيل: ${clean(command.details, 500)}` : null, employee ? `المسؤول: ${clean(employee.name)}` : null,
     command.comment ? `التعليق: ${clean(command.comment, 500)}` : null,
-    command.priority ? `الأولوية: ${{ red: "عالية", yellow: "عادية", green: "منخفضة" }[String(command.priority)] || "عادية"}` : null,
+    command.priority ? `الأولوية: ${PRIORITIES[String(command.priority)]?.label || "غير محددة"}` : null,
     command.dueDate ? `الموعد: ${clean(command.dueDate)}` : null, command.reason ? `السبب: ${clean(command.reason, 350)}` : null];
   return lines.filter(Boolean).join("\n");
 }
@@ -174,7 +206,7 @@ function intakeQuestion(draft: TaskDraft, state: Snapshot): string | null {
   if (!draft.projectId) return `بأي مشروع بدك أضيف المهمة؟${state.projects.some(project => project.status === "active") ? ` المشاريع النشطة: ${state.projects.filter(project => project.status === "active").slice(0, 8).map(project => clean(project.name, 90)).join("، ")}.` : " ما في مشروع نشط حاليًا؛ لازم نجهّز مشروعًا أولًا."}`;
   if (!draft.title) return "شو المهمة أو الشغل المطلوب بالضبط؟";
   if (!draft.ownerId) return "مين بدك يمسك المهمة؟ اذكر الموظف، أو قل «بدون مسؤول حاليًا».";
-  if (!draft.priority) return "شو أولويتها: 🔴 عالية، 🟡 عادية، ولا 🟢 منخفضة؟ هاي أولوية الشغل، مش حالة تنفيذه.";
+  if (!draft.priority) return "شو أولويتها: 🔴 قصوى، 🟡 متوسطة، ولا 🟢 عادية؟ هاي أولوية الشغل، مش حالة تنفيذه.";
   if (!draft.dueDate) return "شو موعدها؟ اذكر التاريخ، أو قل «بدون موعد».";
   return null;
 }
@@ -241,7 +273,7 @@ function taskIntake(db: DatabaseSync, event: Event, actor: ChatUser, state: Snap
   const command = { action: "add_task", projectId: draft.projectId, title: draft.title, ...(draft.details ? { details: draft.details } : {}),
     ownerId: draft.ownerId === "unassigned" ? null : draft.ownerId, priority: draft.priority,
     dueDate: draft.dueDate === "unscheduled" ? null : draft.dueDate, expectedProjectUpdatedAt: project.updatedAt ?? null, expectedProjectStatus: "active" };
-  const reply = `للتأكيد قبل إنشاء المهمة:\nالمشروع: ${clean(project.name, 240)}\nالمهمة: ${draft.title}${draft.details ? `\nالمطلوب: ${draft.details}` : ""}\nالمسؤول: ${owner ? clean(owner.name, 200) : "بدون مسؤول حاليًا"}\nالأولوية: ${{ red: "🔴 عالية", yellow: "🟡 عادية", green: "🟢 منخفضة" }[draft.priority!]}\nالموعد: ${draft.dueDate === "unscheduled" ? "بدون موعد" : draft.dueDate}\nالحالة عند الإنشاء: مفتوحة بانتظار الاستلام.\n\nلم أنشئ المهمة بعد. اكتب «موافق ${token}» أو رد مباشرة بالموافقة على هذه المعاينة؛ وللتراجع اكتب «إلغاء». التأكيد صالح 10 دقائق.`;
+  const reply = `للتأكيد قبل إنشاء المهمة:\nالمشروع: ${clean(project.name, 240)}\nالمهمة: ${draft.title}${draft.details ? `\nالمطلوب: ${draft.details}` : ""}\nالمسؤول: ${owner ? clean(owner.name, 200) : "بدون مسؤول حاليًا"}\nالأولوية: ${PRIORITIES[draft.priority!].icon} ${PRIORITIES[draft.priority!].label}\nالموعد: ${draft.dueDate === "unscheduled" ? "بدون موعد" : draft.dueDate}\nالحالة عند الإنشاء: مفتوحة بانتظار الاستلام.\n\nلم أنشئ المهمة بعد. اكتب «موافق ${token}» أو رد مباشرة بالموافقة على هذه المعاينة؛ وللتراجع اكتب «إلغاء». التأكيد صالح 10 دقائق.`;
   if (reply.length > 3700) return save(db, event, actor, { status: "clarify", reply: "تفاصيل المهمة طويلة للمعاينة الكاملة. اختصر التفاصيل حتى أعرضها كلها قبل التأكيد." }, scope, now);
   db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
   db.prepare("INSERT INTO secretary_pending VALUES(?,?,?,?,?,?,?)").run(key, token, JSON.stringify(command), fingerprint(state), event.text, event.messageId, now + CONFIRM_MS);
@@ -356,10 +388,13 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const input: SecretaryModelInput = { text: event.text, actor: { id: actor.id, name: actor.name, role: actor.role }, focusedTaskId, taskDraft,
     canMessageTeam, messageRecipients: canMessageTeam ? getSecretaryOutboxRecipients(db, config).map(user => ({ id: user.userId, name: user.name })) : [],
     pendingMessagePreview: pendingCommand?.action === "message_team" && typeof pendingCommand.text === "string" && Array.isArray(pendingCommand.recipientIds) ? { text: pendingCommand.text, recipientIds: pendingCommand.recipientIds } : null,
-    tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status })),
+    tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status, priority: t.priority })),
     projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString() };
   const directCreation = event.inputKind !== "voice" && !event.replyToMessageId ? directTaskCreationIntent(input) : null;
-  const plan = directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
+  // A bare color can answer an active creation question; explicit list requests switch topic.
+  const priorityQuery = !event.replyToMessageId && (!taskDraft || /مهام|اعط|أعط|وريني|اعرض|اسرد/u.test(event.text)) ? priorityTaskQuery(event.text, input) : null;
+  const plan = priorityQuery ? emptySecretaryIntent(priorityQuery.kind === "clarify" ? "clarify" : "summary", priorityQuery.kind === "clarify" ? priorityQuery.reply : null)
+    : directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
   let publicReply: string | null = null;
   if (plan.kind === "search") {
     // Require query to be newly supplied, not copied from internal catalog/history by the model.
@@ -379,6 +414,10 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     if (storedIntake) db.prepare("DELETE FROM secretary_task_intake WHERE conversation_key=?").run(key);
     if (pendingDraft) db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
     clearSecretaryChoices(db, key);
+    if (priorityQuery?.kind === "query") {
+      const read = priorityReadReply(priorityQuery, state, now, event.text);
+      return save(db, event, freshActor, read.result, read.scope, now);
+    }
     if (plan.kind === "message_status") {
       try {
         const batch = getSecretaryOutboxStatus(db, { actor: freshActor, origin: { senderNumber: event.senderNumber, groupId: event.groupId } }, config);
