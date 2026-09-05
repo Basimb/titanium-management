@@ -105,6 +105,24 @@ test('child receives normalized allowlists and no Groq/config/inherited runtime 
   assert.equal(JSON.stringify(child).includes('synthetic-secret'), false);
 });
 
+test('OTP worker gets only its private secret and contacts, never Groq', () => {
+  const child = bridgeChildEnvironment({ ...settings, WHATSAPP_LOGIN_ENABLED: 'pilot',
+    WHATSAPP_LOGIN_SECRET: 'cd'.repeat(32), WHATSAPP_LOGIN_DATABASE: path.join(os.tmpdir(), 'otp-test.sqlite') }, env, false, serviceDirectory);
+  assert.equal(child.WHATSAPP_LOGIN_ENABLED, 'pilot');
+  assert.equal(child.WHATSAPP_LOGIN_SECRET, 'cd'.repeat(32));
+  assert.equal(child.GROQ_API_KEY, undefined);
+  assert.equal(child.TITANIUM_TEAM_CHAT_CONFIG, undefined);
+  assert.throws(() => bridgeChildEnvironment({ ...settings, WHATSAPP_LOGIN_ENABLED: '1',
+    WHATSAPP_LOGIN_SECRET: secret, WHATSAPP_LOGIN_DATABASE: path.join(os.tmpdir(), 'otp-test.sqlite') }, env, false, serviceDirectory));
+});
+test('OTP service remains enabled when task automation is disabled', () => {
+  const child = bridgeChildEnvironment({ ...settings, TEAM_CHAT_ENABLED: '0', WHATSAPP_LOGIN_ENABLED: '1',
+    WHATSAPP_LOGIN_SECRET: 'cd'.repeat(32), WHATSAPP_LOGIN_DATABASE: path.join(os.tmpdir(), 'otp-test.sqlite') }, env, false, serviceDirectory);
+  assert.equal(child.TEAM_CHAT_BRIDGE_ENABLED, '1');
+  assert.equal(child.TEAM_CHAT_TASKS_ENABLED, '0');
+  assert.equal(child.WHATSAPP_LOGIN_ENABLED, '1');
+});
+
 test('disabled website settings exit zero without creating state or a child', async () => {
   const f = fixture({ TEAM_CHAT_ENABLED: '0' });
   assert.equal(await launchPrivate({ ...f.dependencies, args: [] }), 0);

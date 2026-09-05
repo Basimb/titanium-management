@@ -41,5 +41,5 @@ export function loadConfig(env, serviceDirectory) {
     throw new Error('state_directory_must_be_private');
   }
   return { botNumber, allowedNumbers, allowedGroups, key, backendUrl: url.href, stateDirectory,
-    allowPairing: env.TEAM_CHAT_PAIR === '1' };
+    allowPairing: env.TEAM_CHAT_PAIR === '1', tasksEnabled: env.TEAM_CHAT_TASKS_ENABLED !== '0' };
 }

@@ -14,7 +14,7 @@ const botNumber = '15551234568';
 const member = '15551234567';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false } = {}) {
+function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false, otpQueue } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'titanium-bridge-runtime-test-'));
   const store = openStore(directory);
   const logger = pino({ level: 'silent' });
@@ -35,7 +35,7 @@ function harness(t, { paired = true, ownNumber = botNumber, allowPairing = false
     clearInterval(job) { if (job) job.cleared = true; },
   };
   const runtime = createBridgeRuntime({
-    ...baileys, config, store, auth, logger, now: () => clock, timers,
+    ...baileys, config, store, auth, logger, now: () => clock, timers, otpQueue,
     makeWASocket(options) {
       // Never call the actual Baileys factory. Every network-capable method is mocked.
       const socket = { options, ev: new EventEmitter(), authState: options.auth, pairCalls: [], endCalls: 0,
@@ -79,6 +79,42 @@ test('installed Baileys exports and real auth serialization are compatible witho
   assert.deepEqual((await reloaded.state.keys.get('tctoken', ['fake'])).fake, Buffer.from([1, 2, 3]));
   assert.deepEqual((await reloaded.state.keys.get('app-state-sync-key', ['fake'])).fake.keyData, Buffer.from([4, 5, 6]));
   assert.equal(h.sockets.length, 0);
+});
+
+test('OTP sends to allowlisted private phone only after account verification and logs no code', async t => {
+  let calls = 0;
+  const h = harness(t, { otpQueue: { async deliverNext(send) {
+    calls++;
+    await send({ to: member, code: '012345', challengeId: 'synthetic-challenge', expiresAt: clock + 300000, signal: new AbortController().signal });
+    return { status: 'sent' };
+  } } });
+  await h.runtime.start();
+  const sent = [];
+  h.sockets[0].sendMessage = async (...args) => sent.push(args);
+  h.intervals[0].fn(); await flush();
+  assert.equal(calls, 0);
+  h.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush();
+  assert.equal(calls, 1);
+  assert.equal(sent[0][0], `${member}@s.whatsapp.net`);
+  assert.match(sent[0][1].text, /012345/);
+  assert.doesNotMatch(h.output.join('\n'), /012345|15551234567/);
+  assert.match(h.output.join('\n'), /Titanium login delivery: sent/);
+});
+
+test('OTP refuses groups, unregistered phones, expired code and shutdown', async t => {
+  const h = harness(t, { otpQueue: { async deliverNext(send) {
+    for (const override of [{ to: '120363000@g.us' }, { to: '15559999999' }, { expiresAt: clock }, { code: 'bad' }]) {
+      await assert.rejects(() => send({ to: member, code: '012345', challengeId: 'test', expiresAt: clock + 300000,
+        signal: new AbortController().signal, ...override }));
+    }
+    return { status: 'failed' };
+  } } });
+  await h.runtime.start();
+  h.sockets[0].ev.emit('connection.update', { connection: 'open' }); await flush();
+  h.intervals[0].fn(); await flush();
+  assert.deepEqual(h.stopped, []);
+  assert.match(h.output.join('\n'), /Titanium login delivery: failed/);
 });
 
 test('only open plus verified actual account marks runtime ready', async t => {

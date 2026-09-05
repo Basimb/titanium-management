@@ -1,9 +1,9 @@
 import { createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { createWhatsAppLoginQueue, deriveLoginKey, normalizeLoginPhone } from "./whatsapp-login-queue.ts";
 
 /**
- * NEXT-PHASE DRAFT: no routes, cookies, WhatsApp transport, or live settings.
- * Existing PIN login is deliberately unchanged.
+ * Server-only OTP core; routes/session policy and live activation are external.
  *
  * Integration contract:
  * - contacts() is administrator-controlled configuration, NEVER request data.
@@ -11,17 +11,18 @@ import type { DatabaseSync } from "node:sqlite";
  *   configuration. Do not trust arbitrary X-Forwarded-For or supplied phone IDs.
  * - deliverOtp must send privately from the management account, never to a group,
  *   and acknowledge delivery acceptance. Never log its code or request body.
- * - Return ONLY prepared.response to the browser, with the same status/shape for
- *   every number. Schedule prepared.deliver through a guaranteed managed worker.
- *   Do NOT await it before responding (account-enumeration timing), and do NOT
- *   fire-and-forget inside a Next request. This closure is not a durable queue:
- *   process loss requires a fresh request after cooldown, and fails closed.
+ * - Production must use deliveryMode:'durable': prepare atomically persists the
+ *   verifier and AES-GCM queue, returns immediately, and deliver() is a no-op.
+ *   A separate managed createWhatsAppLoginQueue worker on the same DB sends it.
+ * - Return ONLY prepared.response with the same status/shape for every number.
+ *   Legacy callback mode is for tests/managed in-memory delivery only; never
+ *   fire-and-forget inside a Next request or await sending before HTTP response.
  * - Protect routes with same-origin/CSRF checks and global edge abuse controls.
  * - After verify succeeds, create the existing application session server-side;
  *   never treat a submitted user ID, name, or a WhatsApp reply as authentication.
  *
- * OTPs exist in memory only; persisted verifier and rate keys use HMAC with an
- * independent cryptographically random >=32-byte server secret, never in git.
+ * Verifiers/rate keys use HMAC; durable payloads use AES-256-GCM. HKDF separates
+ * these keys from an independent random >=32-byte server secret, never in git.
  */
 
 export type LoginContact = { userId: string; number: string };
@@ -46,7 +47,8 @@ type OtpOptions = {
   db: DatabaseSync;
   secret: Uint8Array;
   contacts: () => readonly LoginContact[];
-  deliverOtp: (delivery: OtpDelivery) => Promise<void>;
+  deliverOtp?: (delivery: OtpDelivery) => Promise<void>;
+  deliveryMode?: "memory" | "durable";
   now?: () => number;
   deliveryTimeoutMs?: number;
 };
@@ -67,19 +69,18 @@ const RATE_WINDOW = 15 * 60_000;
 const INVALID = "الرمز غير صالح أو انتهت صلاحيته. اطلب رمزًا جديدًا عند الحاجة.";
 const ACCEPTED = "إذا كان الرقم مسجّلًا ومفعّلًا، سيصلك رمز الدخول برسالة خاصة على واتساب.";
 
-function normalizePhone(input: string): string | null {
-  if (input.length > 40 || !/^[+\d\s().-]+$/.test(input)) return null;
-  const normalized = input.replace(/\D/g, "").replace(/^00/, "");
-  return /^[1-9]\d{7,14}$/.test(normalized) ? normalized : null;
-}
+const normalizePhone = normalizeLoginPhone;
 
 export function createWhatsAppLoginOtp(options: OtpOptions) {
   if (!(options.secret instanceof Uint8Array) || options.secret.byteLength < 32) {
     throw new Error("OTP requires an independent random server secret of at least 32 bytes.");
   }
-  const secret = Buffer.from(options.secret);
+  const secret = deriveLoginKey(options.secret, "verifier");
   const database = options.db;
   const now = options.now ?? Date.now;
+  if (options.deliveryMode !== "durable" && typeof options.deliverOtp !== "function") {
+    throw new Error("OTP requires durable delivery mode or a managed delivery callback.");
+  }
   const timeoutMs = options.deliveryTimeoutMs ?? 10_000;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 15_000) {
     throw new Error("OTP delivery timeout must be between 1 and 15000 milliseconds.");
@@ -108,6 +109,9 @@ export function createWhatsAppLoginOtp(options: OtpOptions) {
       next_allowed_at INTEGER NOT NULL
     );
   `);
+  const durableQueue = options.deliveryMode === "durable"
+    ? createWhatsAppLoginQueue({ db: database, secret: options.secret, contacts: options.contacts, now })
+    : null;
 
   const mac = (...parts: (string | null)[]) =>
     createHmac("sha256", secret).update(JSON.stringify(parts)).digest("hex");
@@ -162,10 +166,11 @@ export function createWhatsAppLoginOtp(options: OtpOptions) {
     let user: LoginUser | null = null;
     const prepared = transaction(() => {
       // These tables contain only disposable OTP/rate state, not account data.
+      durableQueue?.pruneInTransaction(at);
       database.prepare("DELETE FROM whatsapp_login_otp_challenges WHERE expires_at <= ?").run(at);
       database.prepare("DELETE FROM whatsapp_login_otp_rates WHERE window_started_at <= ?").run(at - RATE_WINDOW);
       database.prepare("DELETE FROM whatsapp_login_otp_cooldowns WHERE next_allowed_at <= ?").run(at);
-      const clientAllowed = consumeRate("request-client", client ?? "invalid", 10, at);
+      const clientAllowed = consumeRate("request-client", client ?? "invalid", 30, at);
       const phoneAllowed = consumeRate("request-phone", phoneKey, 3, at);
       const cooldown = database.prepare("SELECT next_allowed_at FROM whatsapp_login_otp_cooldowns WHERE phone_key = ?")
         .get(phoneKey) as { next_allowed_at: number } | undefined;
@@ -173,19 +178,24 @@ export function createWhatsAppLoginOtp(options: OtpOptions) {
       user = registeredUser(phone);
       database.prepare("UPDATE whatsapp_login_otp_challenges SET state = 'superseded' WHERE phone_key = ? AND state IN ('pending','sent')")
         .run(phoneKey);
+      durableQueue?.pruneInTransaction(at);
       database.prepare(`INSERT INTO whatsapp_login_otp_challenges
         (challenge_id, purpose, phone_key, user_id, code_mac, state, attempts, created_at, expires_at)
         VALUES (?, 'login', ?, ?, ?, 'pending', 0, ?, ?)`)
         .run(challengeId, phoneKey, user?.id ?? null, mac("login", challengeId, phoneKey, user?.id ?? null, code), at, expiresAt);
+      if (durableQueue && user) {
+        durableQueue.enqueueInTransaction({ challengeId, to: phone, userId: user.id, code, expiresAt });
+      }
       database.prepare(`INSERT INTO whatsapp_login_otp_cooldowns (phone_key, next_allowed_at) VALUES (?, ?)
         ON CONFLICT(phone_key) DO UPDATE SET next_allowed_at = excluded.next_allowed_at`).run(phoneKey, at + COOLDOWN);
       return true;
     });
     const userId: string | null = (user as LoginUser | null)?.id ?? null;
-    if (!prepared || !userId) code = "";
+    if (!prepared || !userId || durableQueue) code = "";
     let deliveryPromise: Promise<void> | null = null;
 
     async function performDelivery(): Promise<void> {
+      if (durableQueue) return;
       const active = database.prepare("SELECT state, expires_at FROM whatsapp_login_otp_challenges WHERE challenge_id = ?")
         .get(challengeId) as { state: string; expires_at: number } | undefined;
       if (!prepared || !phone || !code || !userId || !active || active.state !== "pending" || active.expires_at <= now()
@@ -198,7 +208,7 @@ export function createWhatsAppLoginOtp(options: OtpOptions) {
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          Promise.resolve().then(() => options.deliverOtp({ to: phone, code, challengeId, expiresAt, signal: controller.signal })),
+          Promise.resolve().then(() => options.deliverOtp!({ to: phone, code, challengeId, expiresAt, signal: controller.signal })),
           new Promise<never>((_, reject) => {
             timeout = setTimeout(() => { controller.abort(); reject(new Error("OTP delivery unavailable")); }, timeoutMs);
           }),
@@ -230,7 +240,7 @@ export function createWhatsAppLoginOtp(options: OtpOptions) {
     const invalid = (): OtpVerification => ({ ok: false, message: INVALID });
     const at = now();
     return transaction(() => {
-      const clientAllowed = consumeRate("verify-client", client ?? "invalid", 30, at);
+      const clientAllowed = consumeRate("verify-client", client ?? "invalid", 60, at);
       const phoneAllowed = consumeRate("verify-phone", phoneKey, 10, at);
       if (!client || !phone || !clientAllowed || !phoneAllowed
         || typeof input.challengeId !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(input.challengeId)) return invalid();

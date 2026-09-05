@@ -4,7 +4,7 @@ import { deliverOne } from './delivery.mjs';
 // Dependency injection allows lifecycle tests without initializing a real socket.
 export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNormalizedUser,
   makeCacheableSignalKeyStore, DisconnectReason, logger, onStop = () => {}, output = console,
-  now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch }) {
+  now = Date.now, timers = { setTimeout, clearTimeout, setInterval, clearInterval }, fetcher = fetch, otpQueue }) {
   let socket;
   let ready = false;
   let stopped = false;
@@ -101,7 +101,7 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
       })().catch(() => stop('connection_handler_failed'));
     });
     current.ev.on('messages.upsert', event => {
-      if (!ready || stopped || current !== socket) return;
+      if (!ready || stopped || current !== socket || config.tasksEnabled === false) return;
       incomingChain = incomingChain.then(async () => {
         for (const message of event.messages) {
           if (!ready || stopped || current !== socket) break;
@@ -116,6 +116,23 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
     if (!ready || stopped || draining) return;
     draining = true;
     void (async () => {
+      if (otpQueue) {
+        const result = await otpQueue.deliverNext(async ({ to, code, challengeId, expiresAt, signal }) => {
+          if (!ready || stopped || signal.aborted || now() >= expiresAt ||
+            !/^[1-9]\d{7,14}$/.test(to) || !config.allowedNumbers.has(to) || !/^\d{6}$/.test(code)) {
+            throw new Error('login_delivery_unavailable');
+          }
+          // Phone-bound private delivery only. OTP content never enters Groq or the chat inbox.
+          await socket.sendMessage(`${to}@s.whatsapp.net`, {
+            text: `رمز دخولك إلى إدارة تيتانيوم: ${code}\nصالح لمدة 5 دقائق ولمرة واحدة. لا تشاركه مع أي شخص.\nإذا لم تطلب الدخول، تجاهل الرسالة.`, linkPreview: null,
+          }, { messageId: `TITANIUMOTP${challengeId.slice(0, 20).toUpperCase()}` });
+        });
+        if (result.status !== 'idle') {
+          output.info(`Titanium login delivery: ${result.status === 'sent' ? 'sent' : 'failed'}.`);
+          return;
+        }
+      }
+      if (config.tasksEnabled === false) return;
       const row = store.next(now());
       if (!row) return;
       await deliverOne(store, row, config, {

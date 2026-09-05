@@ -5,7 +5,8 @@ import { spawn as nativeSpawn } from 'node:child_process';
 import { loadConfig } from './config.mjs';
 
 const SETTINGS_KEYS = new Set(['TEAM_CHAT_ENABLED', 'TEAM_CHAT_SHARED_KEY', 'TEAM_CHAT_CONTACTS_JSON',
-  'TEAM_CHAT_GROUP_IDS_JSON', 'GROQ_API_KEY', 'GROQ_MODEL']);
+  'TEAM_CHAT_GROUP_IDS_JSON', 'GROQ_API_KEY', 'GROQ_MODEL', 'WHATSAPP_LOGIN_ENABLED',
+  'WHATSAPP_LOGIN_SECRET', 'WHATSAPP_LOGIN_DATABASE', 'WHATSAPP_LOGIN_ORIGIN']);
 const MAX_BYTES = 32_768;
 const SERVICE_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -72,7 +73,8 @@ export function bridgeChildEnvironment(settings, env, pair, serviceDirectory = S
     if (typeof env[key] === 'string') childEnv[key] = env[key];
   }
   Object.assign(childEnv, {
-    TEAM_CHAT_BRIDGE_ENABLED: pair || settings.TEAM_CHAT_ENABLED === '1' ? '1' : '0',
+    TEAM_CHAT_BRIDGE_ENABLED: pair || settings.TEAM_CHAT_ENABLED === '1' || ['1', 'pilot'].includes(settings.WHATSAPP_LOGIN_ENABLED) ? '1' : '0',
+    TEAM_CHAT_TASKS_ENABLED: settings.TEAM_CHAT_ENABLED === '1' ? '1' : '0',
     TEAM_CHAT_PAIR: pair ? '1' : '0',
     TEAM_CHAT_SHARED_KEY: settings.TEAM_CHAT_SHARED_KEY,
     TEAM_CHAT_ALLOWED_NUMBERS: numbers.join(','),
@@ -81,6 +83,17 @@ export function bridgeChildEnvironment(settings, env, pair, serviceDirectory = S
     TEAM_CHAT_BACKEND_URL: env.TEAM_CHAT_BACKEND_URL,
     TEAM_CHAT_STATE_DIR: env.TEAM_CHAT_STATE_DIR,
   });
+  if (['1', 'pilot'].includes(settings.WHATSAPP_LOGIN_ENABLED)) {
+    if (!/^[a-fA-F0-9]{64}$/.test(settings.WHATSAPP_LOGIN_SECRET || '') ||
+      settings.WHATSAPP_LOGIN_SECRET.toLowerCase() === settings.TEAM_CHAT_SHARED_KEY?.toLowerCase() ||
+      !path.isAbsolute(settings.WHATSAPP_LOGIN_DATABASE || '')) throw new Error('Invalid private login settings.');
+    Object.assign(childEnv, {
+      WHATSAPP_LOGIN_ENABLED: settings.WHATSAPP_LOGIN_ENABLED,
+      WHATSAPP_LOGIN_SECRET: settings.WHATSAPP_LOGIN_SECRET,
+      WHATSAPP_LOGIN_DATABASE: settings.WHATSAPP_LOGIN_DATABASE,
+      WHATSAPP_LOGIN_CONTACTS_JSON: settings.TEAM_CHAT_CONTACTS_JSON,
+    });
+  }
   loadConfig(childEnv, serviceDirectory);
   return childEnv;
 }
@@ -118,7 +131,7 @@ export async function launchPrivate({ env = process.env, args = process.argv.sli
     if (args.length > 1 || (args.length === 1 && args[0] !== '--pair')) throw new Error();
     const pair = args[0] === '--pair';
     const settings = readPrivateConfig(env.TITANIUM_TEAM_CHAT_CONFIG, fs);
-    if (!pair && settings.TEAM_CHAT_ENABLED !== '1') return 0;
+    if (!pair && settings.TEAM_CHAT_ENABLED !== '1' && !['1', 'pilot'].includes(settings.WHATSAPP_LOGIN_ENABLED)) return 0;
     const childEnv = bridgeChildEnvironment(settings, env, pair, serviceDirectory);
     const directory = path.resolve(childEnv.TEAM_CHAT_STATE_DIR);
     privateStateDirectory(directory, fs);

@@ -2,7 +2,8 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync, type St
 import path from "node:path";
 
 const MAX_SETTINGS_BYTES = 32_768;
-const ALLOWED_KEYS = ["TEAM_CHAT_ENABLED", "TEAM_CHAT_SHARED_KEY", "TEAM_CHAT_CONTACTS_JSON", "TEAM_CHAT_GROUP_IDS_JSON", "GROQ_API_KEY", "GROQ_MODEL"];
+const ALLOWED_KEYS = ["TEAM_CHAT_ENABLED", "TEAM_CHAT_SHARED_KEY", "TEAM_CHAT_CONTACTS_JSON", "TEAM_CHAT_GROUP_IDS_JSON", "GROQ_API_KEY", "GROQ_MODEL",
+  "WHATSAPP_LOGIN_ENABLED", "WHATSAPP_LOGIN_SECRET", "WHATSAPP_LOGIN_DATABASE", "WHATSAPP_LOGIN_ORIGIN"];
 
 function privateRegularFile(metadata: Stats): boolean {
   return metadata.isFile() && !metadata.isSymbolicLink() && metadata.size <= MAX_SETTINGS_BYTES
@@ -39,7 +40,7 @@ export function readTeamChatSettings(env: NodeJS.ProcessEnv = process.env): Reco
     for (const key of ALLOWED_KEYS) {
       const entry = (value as Record<string, unknown>)[key];
       if (entry !== undefined && typeof entry !== "string") throw new Error("setting");
-      settings[key] = entry as string | undefined;
+      if (entry !== undefined) settings[key] = entry as string;
     }
     return settings;
   } catch {

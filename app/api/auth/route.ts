@@ -1,5 +1,6 @@
 import {
   audit,
+  chatDatabase,
   checkLoginBlocked,
   clearLoginAttempts,
   createSession,
@@ -15,7 +16,12 @@ import {
   validPin,
   verifyPin,
 } from "@/lib/titanium-server";
+import { readTeamChatSettings } from "@/lib/team-chat-settings";
+import { whatsappLoginSettings } from "@/lib/whatsapp-login-settings";
+import { createWhatsAppLoginOtp } from "@/lib/whatsapp-login-otp";
+import { boundedLoginBody, sameOriginLoginRequest, requireLoginDatabasePath, LOGIN_CLIENT_BUCKET } from "@/lib/whatsapp-login-http";
 
+export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
@@ -38,24 +44,57 @@ export async function GET(request: Request) {
   try {
     await ensureSeedUsers();
     const user = await getSessionUser(request);
+    const login = whatsappLoginSettings(readTeamChatSettings());
+    if (login.enabled) requireLoginDatabasePath(chatDatabase(), login.databasePath);
+    if (login.replacePin) return privateJson({
+      authMethod: "whatsapp", authenticated: Boolean(user), user,
+      users: [], setupRequired: false, platformAuthenticated: false,
+    });
     const users = await db().prepare("SELECT id, name, CASE WHEN pin_hash IS NULL THEN 0 ELSE 1 END AS pinSet FROM users WHERE active = 1 ORDER BY CASE WHEN id = 'basem' THEN 0 ELSE 1 END, created_at, name").all();
     return privateJson({
+      authMethod: "pin",
       authenticated: Boolean(user),
       user,
       users: users.results,
       setupRequired: await isSetupRequired(),
       platformAuthenticated: isPlatformAuthenticated(request),
     });
-  } catch (error) {
-    return privateJson({ error: error instanceof Error ? error.message : "تعذر فحص الدخول" }, { status: 500 });
+  } catch {
+    return privateJson({ error: "تعذر فحص الدخول مؤقتًا" }, { status: 503 });
   }
 }
 
 export async function POST(request: Request) {
   try {
     await ensureSeedUsers();
-    const body = await request.json() as Record<string, unknown>;
+    const body = await boundedLoginBody(request);
     const action = body.action;
+    const login = whatsappLoginSettings(readTeamChatSettings());
+    if (action === "request-code" || action === "verify-code") {
+      if (!login.enabled) return privateJson({ error: "الدخول عبر واتساب غير متاح مؤقتًا" }, { status: 503 });
+      if (!sameOriginLoginRequest(request, login.origin)) return privateJson({ error: "طلب دخول غير مسموح" }, { status: 403 });
+      const database = chatDatabase();
+      requireLoginDatabasePath(database, login.databasePath);
+      const otp = createWhatsAppLoginOtp({ db: database, secret: login.secret,
+        contacts: () => {
+          const fresh = whatsappLoginSettings(readTeamChatSettings());
+          return fresh.enabled ? fresh.contacts : [];
+        }, deliveryMode: "durable" });
+      const phone = typeof body.phone === "string" ? body.phone : "";
+      if (action === "request-code") {
+        return privateJson(otp.prepare({ phone, clientKey: LOGIN_CLIENT_BUCKET }).response, { status: 202 });
+      }
+      const result = otp.verify({ phone, clientKey: LOGIN_CLIENT_BUCKET,
+        challengeId: typeof body.challengeId === "string" ? body.challengeId : "",
+        code: typeof body.code === "string" ? body.code : "" });
+      if (!result.ok) return privateJson({ error: result.message }, { status: 401 });
+      const session = await createSession(result.user, request);
+      await audit(result.user, "login_whatsapp", "user", result.user.id, "تم تسجيل الدخول برمز واتساب لمرة واحدة");
+      return privateJson({ authenticated: true, user: result.user, sessionToken: session.token }, { headers: { "set-cookie": session.cookie } });
+    }
+    if (login.replacePin && (action === "login" || action === "setup")) {
+      return privateJson({ error: "تم إلغاء الدخول بالـPIN؛ اطلب رمز الدخول عبر واتساب", authMethod: "whatsapp" }, { status: 410 });
+    }
 
     if (action === "setup") {
       if (!(await isSetupRequired())) {
@@ -115,7 +154,7 @@ export async function POST(request: Request) {
     }
 
     return privateJson({ error: "الطلب غير معروف" }, { status: 400 });
-  } catch (error) {
-    return privateJson({ error: error instanceof Error ? error.message : "تعذر تنفيذ الدخول" }, { status: 500 });
+  } catch {
+    return privateJson({ error: "تعذر تنفيذ الدخول مؤقتًا؛ حاول مرة أخرى" }, { status: 503 });
   }
 }

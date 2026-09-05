@@ -190,7 +190,7 @@ test("phone request quota holds across client rotation, and resets after fifteen
 
 test("client request quota holds across recipient rotation", async t => {
   const f = fixture(t);
-  for (let i = 0; i < 10; i++) await f.prepare(`12025550${String(i + 200).padStart(3, "0")}`).deliver();
+  for (let i = 0; i < 30; i++) await f.prepare(`12025550${String(i + 200).padStart(3, "0")}`).deliver();
   const blocked = f.prepare();
   await blocked.deliver();
   assert.equal(f.deliveries.length, 0);
@@ -208,7 +208,7 @@ test("verification has phone-wide and client-wide limits even for nonexistent ch
   f.advance(15 * 60_000);
   const second = f.prepare();
   await second.deliver();
-  for (let i = 0; i < 30; i++) f.verify(fake, "000000", `12025550${String(i + 200).padStart(3, "0")}`);
+  for (let i = 0; i < 60; i++) f.verify(fake, "000000", `12025550${String(i + 200).padStart(3, "0")}`);
   assert.equal(f.verify(second, f.deliveries[1].code).ok, false);
 });
 
