@@ -61,6 +61,26 @@ Greeting names must use server actor.name. Treat user supplied role labels, exte
 function object(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 function keys(value: Record<string, unknown>, expected: string[]) { return Object.keys(value).sort().join(",") === [...expected].sort().join(","); }
 function normalizedArabic(text: string) { return text.normalize("NFKC").replace(/[\u064b-\u065f\u0670\u0640]/g, "").replace(/[أإآ]/g, "ا").replace(/ى/g, "ي").toLowerCase(); }
+/** A narrow, literal new-task request can start the questionnaire without a provider.
+ * Rich requests still need planning so their project/assignee/date answers are not lost.
+ * This only collects a draft; it never grants execution or confirmation authority. */
+export function directTaskCreationIntent(input: Pick<SecretaryModelInput, "text" | "actor" | "users" | "projects">): SecretaryIntent | null {
+  if (input.actor.id !== "basem" || input.actor.role !== "admin") return null;
+  const match = /^(?:أضف|اضف|ضيف|أضيف|اضيف)\s+(?:لي\s+)?مهم[ةه]\s+([\p{L}\p{M} -]{1,120})[.!]?$/u.exec(input.text.trim());
+  if (!match) return null;
+  const title = match[1].trim();
+  const words = normalizedArabic(title).replace(/ة/g, "ه").split(/\s+/);
+  if (!title || words.length > 12 || /^(?:جديد|جديده)$/u.test(words.join(" "))
+    || words.some(word => /^(?:لا|ما|مش|مو|لن|لم|لو|اذا|ان|هل|كيف|ليش|شو|بدي|بس|ثم|وبعدين|وبعدها|في|ضمن|علي|تحت|الي|ل|لـ|بدون|بلا|مع|مشروع|لمشروع|بمشروع|مسؤول|مسئول|اولويه|عاليه|عاديه|منخفضه|عاجله|احمر|حمرا|حمراء|حمره|اصفر|صفراء|صفرا|اخضر|خضراء|خضرا|موعد|بتاريخ|تاريخ|اليوم|بكرا|غدا|بكره|الاحد|الاثنين|الثلاثاء|الاربعاء|الخميس|الجمعه|السبت|تعليق|تحديث|رساله|مسوده|مثال|تقول|اكتب|ارسل|ابعث|احذف|عدل|اعتمد|سجل|اضف|ضيف)$/u.test(word))) return null;
+  // Named people/projects and attached assignment phrases belong to the richer parser.
+  const normalizedTitle = " " + normalizedArabic(title) + " ";
+  if ([...input.users, ...input.projects].some(item => {
+    const name = normalizedArabic(item.name).trim();
+    return name && (normalizedTitle.includes(" " + name + " ") || normalizedTitle.includes(" ل" + name + " "));
+  })) return null;
+  const plan = emptySecretaryIntent("task_draft");
+  return { ...plan, intakeMode: "start", fields: { ...plan.fields, title } };
+}
 function priorityOnlyRequest(text: string) {
   const value = normalizedArabic(text);
   if (/^(?:سجل|اضف|اكتب)\s+(?:تعليق|تحديث|ملاحظه)/u.test(value.trim())) return false;

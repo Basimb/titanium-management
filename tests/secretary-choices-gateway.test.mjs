@@ -21,7 +21,7 @@ function setup(t) {
   const config={enabled:true,sharedKey:key,contacts:[{userId:'basem',number}],allowedGroupIds:[]};
   let seq=0,calls=0;
   const send=async(extra={},infer)=>{
-    const raw=JSON.stringify({messageId:`VOTE-${++seq}`,responseMessageId:`REPLY-${seq}`,senderNumber:number,groupId:null,text:'أضف مهمة تقرير تجريبي',receivedAt:clock,...extra});
+    const raw=JSON.stringify({messageId:`VOTE-${++seq}`,responseMessageId:`REPLY-${seq}`,senderNumber:number,groupId:null,text:'أضف مهمة تقرير تجريبي ضمن مشروع تجريبي بدون مسؤول حاليًا',receivedAt:clock,...extra});
     const timestamp=String(clock);
     const request=new Request('https://example.test/api/whatsapp/team-chat',{method:'POST',body:raw,headers:{'content-type':'application/json','x-titanium-chat-timestamp':timestamp,'x-titanium-chat-signature':signTeamChatBody(raw,timestamp,key)}});
     const response=await handleTeamChatRequest(request,{config,getDatabase:()=>db,now:()=>clock,

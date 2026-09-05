@@ -2,6 +2,15 @@ import { createHmac } from 'node:crypto';
 import { boundedPlainText } from './group-privacy.mjs';
 import { normalizePollChoices } from './polls.mjs';
 
+const BACKEND_UNCONFIRMED_REPLY = 'تعذّر التأكد من نتيجة طلبك الآن. إذا كان يغيّر بيانات، راجع الموقع قبل إعادة إرساله. إذا كان مجرد سؤال، جرّب لاحقًا.';
+function backendUnavailable(store, row, reason) {
+  // An earlier timed-out attempt may have committed on the website. This is
+  // feedback only, not permission to replay the command under another ID.
+  const reasons = { backend_network: 'backend_network_exhausted', backend_429: 'backend_429_exhausted', backend_503: 'backend_503_exhausted' };
+  store.backendResult(row.id, { status: 'unavailable', reply: BACKEND_UNCONFIRMED_REPLY,
+    failureReason: Object.hasOwn(reasons, reason) ? reasons[reason] : 'backend_retry_exhausted' });
+}
+
 export function signatureHeaders(rawBody, key, now) {
   const timestamp = String(now);
   return {
@@ -55,7 +64,7 @@ export async function deliverOne(store, row, config, { fetcher = fetch, sendRepl
     return;
   }
   if (row.state === 'backend') {
-    if (row.backend_attempts >= 5) { store.fail(row.id, 'backend_retry_exhausted'); return; }
+    if (row.backend_attempts >= 5) { backendUnavailable(store, row, row.error_code); return; }
     store.attemptBackend(row.id);
     let response;
     try {
@@ -66,13 +75,13 @@ export async function deliverOne(store, row, config, { fetcher = fetch, sendRepl
         redirect: 'error', signal: AbortSignal.timeout(50_000),
       });
     } catch {
-      if (row.backend_attempts + 1 >= 5) store.fail(row.id, 'backend_retry_exhausted');
+      if (row.backend_attempts + 1 >= 5) backendUnavailable(store, row, 'backend_network');
       else store.retry(row.id, 'backend', now() + Math.min(60_000, 2000 * 2 ** row.backend_attempts), 'backend_network');
       return;
     }
     if (response.status === 429 || response.status === 503) {
       await response.body?.cancel().catch(() => {});
-      if (row.backend_attempts + 1 >= 5) store.fail(row.id, 'backend_retry_exhausted');
+      if (row.backend_attempts + 1 >= 5) backendUnavailable(store, row, `backend_${response.status}`);
       else store.retry(row.id, 'backend', now() + Math.min(60_000, 2000 * 2 ** row.backend_attempts), `backend_${response.status}`);
       return;
     }

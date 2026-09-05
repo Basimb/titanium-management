@@ -136,7 +136,7 @@ test('cancel and unrelated topic invalidate choice authority even with unchanged
 });
 
 test('new task replaces all choice mappings rather than carrying an old answer across tasks',async t=>{
-  const f=fixture(t);const first=await f.run(draft({title:'الأولى'},'p'));const next=await f.run(draft({title:'الثانية'},'q'),{text:'ضيف مهمة ثانية'});
+  const f=fixture(t);const first=await f.run(draft({title:'الأولى'},'p'));const next=await f.run(draft({title:'الثانية'},'q'),{text:'ضيف مهمة الثانية ضمن مشروع آخر'});
   assert.notEqual(next.choices.id,first.choices.id);assert.equal((await f.execute(f.pick(first,0))).status,'clarify');assert.equal(saved(f).title,'الثانية');assert.equal(saved(f).projectId,'q');assert.equal(saved(f).ownerId,null);
 });
 

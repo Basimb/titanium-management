@@ -242,7 +242,7 @@ test('SQLite auth persists credentials, all Signal categories, null deletion and
   assert.equal((await restored.state.keys.get('lid-mapping', ['a'])).a, undefined);
 });
 
-test('backend retries identical body only on network, 429 and 503, then stops', async t => {
+test('backend retries identical body only on network, 429 and 503, then queues honest feedback without replay', async t => {
   const f = fixture(t);
   const initial = enqueue(f.store);
   const bodies = [];
@@ -259,10 +259,13 @@ test('backend retries identical body only on network, 429 and 503, then stops', 
       } });
     clock += 60_000;
   }
-  assert.equal(f.store.next(clock), undefined);
+  const feedback = f.store.next(clock);
+  assert.equal(feedback.state, 'reply');
+  assert.equal(feedback.reply_id, initial.reply_id);
   assert.equal(new Set(bodies).size, 1);
   assert.equal(bodies[0], initial.raw_body);
-  assert.equal(f.store.db.prepare('SELECT state FROM inbox').get().state, 'failed');
+  assert.equal(JSON.parse(feedback.result).status, 'unavailable');
+  assert.equal(JSON.parse(feedback.result).failureReason, 'backend_429_exhausted');
 });
 
 test('backend timeout is bounded at 50 seconds and covers planning plus public search', async t => {
