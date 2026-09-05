@@ -19,6 +19,7 @@ import {
 import { readTeamChatSettings } from "@/lib/team-chat-settings";
 import { whatsappLoginSettings } from "@/lib/whatsapp-login-settings";
 import { createWhatsAppLoginOtp } from "@/lib/whatsapp-login-otp";
+import { whatsappLoginNames, whatsappLoginPhoneForUser } from "@/lib/whatsapp-login-directory";
 import { boundedLoginBody, sameOriginLoginRequest, requireLoginDatabasePath, LOGIN_CLIENT_BUCKET } from "@/lib/whatsapp-login-http";
 
 export const runtime = "nodejs";
@@ -48,7 +49,8 @@ export async function GET(request: Request) {
     if (login.enabled) requireLoginDatabasePath(chatDatabase(), login.databasePath);
     if (login.replacePin) return privateJson({
       authMethod: "whatsapp", authenticated: Boolean(user), user,
-      users: [], setupRequired: false, platformAuthenticated: false,
+      users: [], loginUsers: whatsappLoginNames(chatDatabase(), login.contacts),
+      setupRequired: false, platformAuthenticated: false,
     });
     const users = await db().prepare("SELECT id, name, CASE WHEN pin_hash IS NULL THEN 0 ELSE 1 END AS pinSet FROM users WHERE active = 1 ORDER BY CASE WHEN id = 'basem' THEN 0 ELSE 1 END, created_at, name").all();
     return privateJson({
@@ -80,7 +82,9 @@ export async function POST(request: Request) {
           const fresh = whatsappLoginSettings(readTeamChatSettings());
           return fresh.enabled ? fresh.contacts : [];
         }, deliveryMode: "durable" });
-      const phone = typeof body.phone === "string" ? body.phone : "";
+      // Resolve the selected account on the server for both issue and verify.
+      // Unknown/disabled/ambiguous names still receive the generic OTP response.
+      const phone = whatsappLoginPhoneForUser(database, login.contacts, body.userId);
       if (action === "request-code") {
         return privateJson(otp.prepare({ phone, clientKey: LOGIN_CLIENT_BUCKET }).response, { status: 202 });
       }
@@ -88,6 +92,7 @@ export async function POST(request: Request) {
         challengeId: typeof body.challengeId === "string" ? body.challengeId : "",
         code: typeof body.code === "string" ? body.code : "" });
       if (!result.ok) return privateJson({ error: result.message }, { status: 401 });
+      if (result.user.id !== body.userId) return privateJson({ error: "الرمز غير صالح أو انتهت صلاحيته. اطلب رمزًا جديدًا عند الحاجة." }, { status: 401 });
       const session = await createSession(result.user, request);
       await audit(result.user, "login_whatsapp", "user", result.user.id, "تم تسجيل الدخول برمز واتساب لمرة واحدة");
       return privateJson({ authenticated: true, user: result.user, sessionToken: session.token }, { headers: { "set-cookie": session.cookie } });

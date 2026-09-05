@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { WhatsAppLogin } from "@/components/whatsapp-login";
-import type { WhatsAppLoginSuccess } from "@/components/whatsapp-login-helpers";
+import { publicWhatsAppLoginUsers, type WhatsAppLoginSuccess, type WhatsAppLoginUser } from "@/components/whatsapp-login-helpers";
 import { SecretaryActivity } from "@/components/secretary-activity";
 import { SecretaryLinkButton } from "@/components/secretary-link-button";
 import { createSecretaryLink, resolveSecretaryDeepLink, secretaryActivityTarget, type SecretaryTarget } from "@/components/secretary-ui-helpers";
@@ -32,6 +32,7 @@ export default function Dashboard() {
   const [data, setData] = useState<State>(emptyState);
   const [loading, setLoading] = useState(true);
   const [loginUsers, setLoginUsers] = useState<Array<{id:string;name:string;pinSet:number}>>([]);
+  const [whatsappUsers, setWhatsappUsers] = useState<WhatsAppLoginUser[]>([]);
   const [setupRequired, setSetupRequired] = useState(false);
   const [authMethod, setAuthMethod] = useState<"pin" | "whatsapp" | null>(null);
   const [platformAuthenticated, setPlatformAuthenticated] = useState(false);
@@ -97,8 +98,10 @@ export default function Dashboard() {
       const response = await fetch(`/api/auth?v=${crypto.randomUUID()}`, { cache:"no-store", credentials:"include", headers:sessionHeaders() });
       const auth = await response.json();
       if (!response.ok) throw new Error(auth.error || "تعذر فحص الدخول");
+      if (auth.authMethod !== "whatsapp" && auth.authMethod !== "pin") throw new Error("تعذر تحميل طريقة الدخول");
       const whatsapp = auth.authMethod === "whatsapp";
       setAuthMethod(whatsapp ? "whatsapp" : "pin");
+      setWhatsappUsers(whatsapp ? publicWhatsAppLoginUsers(auth.loginUsers) : []);
       setLoginUsers(whatsapp ? [] : auth.users || []); setSetupRequired(!whatsapp && Boolean(auth.setupRequired)); setPlatformAuthenticated(Boolean(auth.platformAuthenticated));
       if (whatsapp) { setLoginPin(""); setSetupPin(""); setUserPins({}); setOldPin(""); setNewPin(""); setChangePinOpen(false); }
       if (auth.authenticated && auth.user) {
@@ -107,7 +110,11 @@ export default function Dashboard() {
         setData(current => ({ ...current, currentUser: auth.user }));
         await loadState();
       }
-    } catch (error) { toast.error(error instanceof Error ? error.message : "تعذر فحص الدخول"); }
+    } catch (error) {
+      setWhatsappUsers([]);
+      setAuthMethod(current => current === "whatsapp" ? "whatsapp" : null);
+      toast.error(error instanceof Error ? error.message : "تعذر فحص الدخول");
+    }
     finally { setLoading(false); }
   }
 
@@ -272,8 +279,8 @@ export default function Dashboard() {
     <Toaster position="top-center" richColors />
     <Dialog open={!currentUser} onOpenChange={() => undefined}>
       <DialogContent dir="rtl" showCloseButton={false} className="titanium-login-dialog">
-        <DialogHeader className="text-right"><DialogTitle>{setupRequired ? "إعداد حساب باسم لأول مرة" : "دخول فريق الإدارة"}</DialogTitle><DialogDescription>{authMethod === null ? "يلزم الاتصال بالموقع للتحقق من طريقة الدخول المتاحة." : whatsappLogin ? "أدخل رقمك المسجّل لدى الإدارة، ثم رمز التحقق الذي يصلك برسالة خاصة على واتساب." : setupRequired ? "مالك الموقع يحدد كود باسم أولاً، وبعد الدخول يحدد أكواد باقي الفريق." : "اختر اسمك واكتب الكود الخاص بك."}</DialogDescription></DialogHeader>
-        {authMethod === null ? <div className="titanium-dialog-grid"><p className="titanium-warning" role="alert">تعذر تحميل إعدادات الدخول. تأكد من الإنترنت ثم أعد المحاولة.</p><Button onClick={() => void refreshAuth()}>إعادة المحاولة</Button></div> : whatsappLogin ? <WhatsAppLogin onAuthenticated={completeWhatsAppLogin} /> : setupRequired ? <div className="titanium-dialog-grid">
+        <DialogHeader className="text-right"><DialogTitle>{setupRequired ? "إعداد حساب باسم لأول مرة" : "دخول فريق الإدارة"}</DialogTitle><DialogDescription>{authMethod === null ? "يلزم الاتصال بالموقع للتحقق من طريقة الدخول المتاحة." : whatsappLogin ? "اختر اسمك واضغط إرسال الرمز، ثم أدخل رمز التحقق الذي يصلك على واتساب المسجّل لك." : setupRequired ? "مالك الموقع يحدد كود باسم أولاً، وبعد الدخول يحدد أكواد باقي الفريق." : "اختر اسمك واكتب الكود الخاص بك."}</DialogDescription></DialogHeader>
+        {authMethod === null ? <div className="titanium-dialog-grid"><p className="titanium-warning" role="alert">تعذر تحميل إعدادات الدخول. تأكد من الإنترنت ثم أعد المحاولة.</p><Button onClick={() => void refreshAuth()}>إعادة المحاولة</Button></div> : whatsappLogin ? <WhatsAppLogin users={whatsappUsers} onAuthenticated={completeWhatsAppLogin} /> : setupRequired ? <div className="titanium-dialog-grid">
           {!platformAuthenticated && <p className="titanium-warning">الإعداد الأول متاح لمالك الموقع من الصفحة الخاصة فقط.</p>}
           <div className="titanium-field"><label>كود باسم الجديد</label><Input type="password" inputMode="numeric" value={setupPin} onChange={event => setSetupPin(event.target.value)} placeholder="من 4 إلى 8 أرقام" /></div>
           <Button disabled={!platformAuthenticated} onClick={() => authAction({ action:"setup", pin:setupPin }, "تم إعداد حساب باسم")}>بدء الاستخدام</Button>

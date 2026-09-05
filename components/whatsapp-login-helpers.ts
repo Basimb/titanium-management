@@ -1,5 +1,23 @@
-// UI-only normalization. The server remains authoritative for phone ownership,
+// UI-only validation. The server remains authoritative for phone ownership,
 // expiry, resend limits and code verification. Nothing here stores a secret.
+export type WhatsAppLoginUser = { id: string; name: string };
+
+export function publicWhatsAppLoginUsers(value: unknown): WhatsAppLoginUser[] {
+  if (!Array.isArray(value) || value.length > 100) return [];
+  const users: WhatsAppLoginUser[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+    const user = entry as Record<string, unknown>;
+    if (typeof user.id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(user.id) || seen.has(user.id)
+      || typeof user.name !== "string" || !user.name.trim() || user.name.length > 160) return [];
+    seen.add(user.id);
+    // Copy the public contract only; never retain a phone or server metadata.
+    users.push({ id: user.id, name: user.name.trim() });
+  }
+  return users;
+}
+
 export function latinDigits(value: string): string {
   return value.normalize("NFKC")
     .replace(/[٠-٩]/g, digit => String(digit.charCodeAt(0) - 0x660))

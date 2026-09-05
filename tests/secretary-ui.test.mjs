@@ -204,7 +204,7 @@ test("dashboard waits for authorized state and provides accessible focus, archiv
 test("secretary UI changes retain server-selected OTP login, in-memory token and fresh authenticated state", async () => {
   const source = await read("../app/dashboard.tsx");
   assert.match(source, /auth\.authMethod === "whatsapp"/);
-  assert.match(source, /whatsappLogin \? <WhatsAppLogin onAuthenticated=\{completeWhatsAppLogin\}/);
+  assert.match(source, /whatsappLogin \? <WhatsAppLogin users=\{whatsappUsers\} onAuthenticated=\{completeWhatsAppLogin\}/);
   assert.match(source, /if \(next\.sessionToken\) sessionTokenRef\.current = next\.sessionToken/);
   assert.match(source, /!whatsappLogin && <Dialog open=\{changePinOpen\}/);
   assert.match(source, /cache:"no-store", credentials:"include", headers:sessionHeaders\(\)/);
