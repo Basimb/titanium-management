@@ -75,15 +75,57 @@ test("idempotent source and reversed selection order keep one frozen batch; chan
   assert.equal(f.db.prepare("SELECT count(*) AS n FROM secretary_outbox_batches").get().n, 1);
 });
 
-test("confirmation atomically queues once with deterministic per-recipient message IDs", t => {
+test("confirmation atomically queues once with durable per-recipient message IDs", t => {
   const f = fixture(t); const p = f.preview();
   const confirmed = f.confirm(p, { confirmationMessageId: "accepted-confirmation" });
   assert.equal(confirmed.state, "queued"); assert.equal(confirmed.recipientCount, 2); assert.equal(confirmed.pendingCount, 2);
   assert.equal(f.confirm(p, { confirmationMessageId: "accepted-confirmation" }).pendingCount, 2);
   assert.equal(f.confirm(p, { confirmationMessageId: "another-confirmation" }).pendingCount, 2);
   assert.equal(rows(f).length, 2); assert.equal(new Set(rows(f).map(row => row.message_id)).size, 2);
-  assert.ok(rows(f).every(row => /^TITANIUMOUT[A-F0-9]+$/.test(row.message_id)));
+  assert.ok(rows(f).every(row => /^3EB0[A-F0-9]{36}$/.test(row.message_id)));
   assert.doesNotMatch(JSON.stringify(confirmed), /1202555|phone/);
+});
+
+test("new delivery and owner-report IDs use the established native format and stay fixed across replay", t => {
+  const f = fixture(t), ids = [];
+  for (let i = 0; i < 4; i++) {
+    const sourceMessageId = `native-format-${i}`, p = f.preview({ sourceMessageId });
+    const receiptId = f.db.prepare("SELECT receipt_message_id FROM secretary_outbox_batches WHERE id=?").get(p.batchId).receipt_message_id;
+    assert.match(receiptId, /^3EB0[A-F0-9]{36}$/);
+    assert.equal(f.preview({ sourceMessageId }).batchId, p.batchId);
+    f.confirm(p, { confirmationMessageId: `native-confirm-${i}` });
+    const before = rows(f).map(row => ({ ...row }));
+    f.confirm(p, { confirmationMessageId: `native-confirm-${i}` });
+    f.confirm(p, { confirmationMessageId: `native-confirm-duplicate-${i}` });
+    f.preview({ sourceMessageId });
+    assert.deepEqual(rows(f).map(row => ({ ...row })), before);
+    assert.equal(f.db.prepare("SELECT receipt_message_id FROM secretary_outbox_batches WHERE id=?").get(p.batchId).receipt_message_id, receiptId);
+    ids.push(receiptId, ...before.filter(row => row.batch_id === p.batchId).map(row => row.message_id));
+  }
+  assert.equal(ids.length, 12); assert.equal(new Set(ids).size, ids.length);
+  assert.ok(ids.every(id => /^3EB0[A-F0-9]{36}$/.test(id)));
+});
+
+test("legacy queued and attempted IDs survive migration and replay with their exact evidence bindings", t => {
+  const f = fixture(t), sourceMessageId = "legacy-id-source", p = f.preview({ sourceMessageId });
+  const receiptId = "TITANIUMOUTSUMMARY" + p.batchId.toUpperCase();
+  f.db.prepare("UPDATE secretary_outbox_batches SET receipt_message_id=? WHERE id=?").run(receiptId, p.batchId);
+  f.confirm(p);
+  for (const row of rows(f)) f.db.prepare("UPDATE secretary_outbox_deliveries SET message_id=? WHERE id=?").run("TITANIUMOUT" + row.id.toUpperCase(), row.id);
+  f.db.prepare("UPDATE secretary_outbox_deliveries SET state='uncertain',sending_at=?,finished_at=? WHERE recipient_id='a'").run(f.now, f.now);
+  f.db.prepare("UPDATE secretary_outbox_batches SET receipt_state='uncertain',receipt_sending_at=? WHERE id=?").run(f.now, p.batchId);
+  const before = rows(f).map(row => ({ ...row }));
+  const batchBefore = { ...f.db.prepare("SELECT * FROM secretary_outbox_batches WHERE id=?").get(p.batchId) };
+  migrateSecretaryOutbox(f.db); f.preview({ sourceMessageId }); f.confirm(p);
+  const jobs = f.jobs(), attempted = before.find(row => row.recipient_id === "a"), queued = before.find(row => row.recipient_id === "b");
+  assert.deepEqual(jobs.getTransportBinding(attempted.message_id), { messageId: attempted.message_id, to: "12025550101@s.whatsapp.net", kind: "delivery" });
+  assert.equal(jobs.getTransportBinding(queued.message_id), null);
+  assert.equal(jobs.recordTransportUpdate({ messageId: attempted.message_id, to: "12025550101@s.whatsapp.net", status: "server_ack", at: f.now }).status, "recorded");
+  assert.deepEqual(jobs.getTransportBinding(receiptId), { messageId: receiptId, to: "12025550103@s.whatsapp.net", kind: "receipt" });
+  assert.equal(jobs.recordTransportUpdate({ messageId: receiptId, to: "12025550103@s.whatsapp.net", status: "read", at: f.now }).status, "recorded");
+  assert.deepEqual(rows(f).map(row => ({ ...row })), before);
+  assert.deepEqual({ ...f.db.prepare("SELECT * FROM secretary_outbox_batches WHERE id=?").get(p.batchId) }, batchBefore);
+  assert.equal(f.status().acceptedCount, 1); assert.equal(f.status().readCount, 0);
 });
 
 test("one source event is not its own approval; confirmation cannot approve another batch twice", t => {

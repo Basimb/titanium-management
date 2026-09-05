@@ -29,6 +29,9 @@ export class SecretaryOutboxError extends Error {
 }
 const fail = (status: number, code: string, message: string): never => { throw new SecretaryOutboxError(status, code, message); };
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+// Match Baileys' established generateMessageID() format. Generate only on INSERT:
+// persisted IDs remain the durable transport/evidence binding, including legacy IDs.
+const newTransportMessageId = () => "3EB0" + randomBytes(18).toString("hex").toUpperCase();
 const PREVIEW_MS = 10 * 60_000, STALE_SEND_MS = 60_000, MAX_QUEUE_MS = 24 * 60 * 60_000;
 const MAX_RECIPIENTS = 20, MAX_BATCHES_PER_HOUR = 10, MAX_QUEUED_DELIVERIES = 200;
 let savepoint = 0;
@@ -177,7 +180,7 @@ export function createSecretaryOutboxPreview(db: DatabaseSync, input: Identity &
     if (recipients.length > MAX_RECIPIENTS) return fail(400, "too_many_recipients", "الحد الأقصى للدفعة الواحدة 20 مستلمًا؛ حدّد قائمة أصغر");
     const id = randomBytes(16).toString("hex");
     db.prepare("INSERT INTO secretary_outbox_batches(id,source_key,payload_hash,source_message_id,requester_id,requester_name,requester_phone,body,recipients_json,created_at,expires_at,receipt_message_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-      .run(id, sourceKey, payloadHash, source, requester.actor.id, requester.actor.name, requester.phone, text, JSON.stringify(recipients), now, now + PREVIEW_MS, "TITANIUMOUTSUMMARY" + id.toUpperCase());
+      .run(id, sourceKey, payloadHash, source, requester.actor.id, requester.actor.name, requester.phone, text, JSON.stringify(recipients), now, now + PREVIEW_MS, newTransportMessageId());
     return publicPreview(batchById(db, id));
   });
 }
@@ -212,7 +215,7 @@ export function confirmSecretaryOutboxPreview(db: DatabaseSync, input: Identity 
     for (const item of frozenRecipients(batch)) {
       const id = digest([batch.id, item.userId]);
       db.prepare("INSERT INTO secretary_outbox_deliveries(id,batch_id,recipient_id,recipient_name,recipient_phone,message_id,created_at) VALUES(?,?,?,?,?,?,?)")
-        .run(id, batch.id, item.userId, item.name, item.phone, "TITANIUMOUT" + id.toUpperCase(), now);
+        .run(id, batch.id, item.userId, item.name, item.phone, newTransportMessageId(), now);
     }
     db.prepare("UPDATE secretary_outbox_batches SET state='queued',confirmed_at=?,confirmation_key=?,confirmation_message_id=?,receipt_state='queued' WHERE id=? AND confirmed_at IS NULL")
       .run(now, confirmationKey, confirmation, batch.id);
