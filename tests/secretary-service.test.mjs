@@ -66,7 +66,7 @@ test('a disputed private answer is recalled across days without turning criticis
 });
 
 test('secretary scoped friendly summary has direct link and no foreign data', async t=>{
- const f=fixture(t); const result=await f.run(); assert.equal(result.status,'summary'); assert.match(result.reply,/خالد/);assert.match(result.reply,/project=p&task=t/);assert.doesNotMatch(result.reply,/مهمة شادي|تفاصيل سرية/);
+ const f=fixture(t); const result=await f.run(); assert.equal(result.status,'summary'); assert.match(result.reply,/خالد/);assert.match(result.reply,/🔴 \*لوحة\*/);assert.doesNotMatch(result.reply,/https?:\/\/|مهمة شادي|تفاصيل سرية/);
 });
 test('task card colors are actual priority, never completion or lateness',()=>{
  const state={projects:[{id:'p',name:'مشروع'}],comments:[]};
@@ -111,7 +111,7 @@ test('priority pagination declares counts, stays bounded and preserves every tas
  let text='المهام الحمراء';const seen=new Set();let pages=0;
  for(;;){
   const r=await run(text);pages++;assert.ok(r.reply.length<=3800);assert.match(r.reply,/المطابق ضمن صلاحياتك \(دون الأرشيف\): 19/);
-  for(const match of r.reply.matchAll(/&task=([^\s]+)/g)){assert.ok(!seen.has(match[1]));seen.add(match[1]);}
+  for(const match of r.reply.matchAll(/^\d+\. 🔴 \*([^*]+)\*/gm)){assert.ok(!seen.has(match[1]));seen.add(match[1]);}
   const next=/للتكملة اكتب: «([^»]+)»/.exec(r.reply);if(!next)break;text=next[1];assert.ok(pages<10);
  }
  assert.equal(seen.size,19);assert.ok(pages>=2);
