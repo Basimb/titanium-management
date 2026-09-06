@@ -238,22 +238,42 @@ export function validateSecretaryIntent(value: unknown, input: SecretaryModelInp
   return plan;
 }
 
+export class SecretaryProviderError extends Error {
+  code: string; retryAfterSeconds: number;
+  constructor(code: string, retryAfterSeconds = 0) { super("Secretary service unavailable."); this.name = "SecretaryProviderError"; this.code = code; this.retryAfterSeconds = retryAfterSeconds; }
+}
+function plannerPrompt(input: SecretaryModelInput) {
+  return PROMPT.split("\n").filter(line => input.review || !/^(REVIEW MODE:|Review is READ-ONLY|In review,)/.test(line)).join("\n")
+    + "\nREQUIRED OUTPUT: Include every schema key, especially fields with ALL nine keys; unused values are null. Never omit fields.";
+}
+function plannerContext(input: SecretaryModelInput) {
+  let length = 0; const history = [];
+  for (const turn of [...input.history].reverse()) { if (length + turn.content.length > 2400) break; history.unshift(turn); length += turn.content.length; }
+  return { ...input, history };
+}
 async function jsonResponse(response: Response) {
-  if (!response.ok || !response.body) throw new Error("Secretary service unavailable.");
+  if (!response.body) throw new SecretaryProviderError("empty_response", 60);
   const reader = response.body.getReader(); const parts: Uint8Array[] = []; let size = 0;
   try { for (;;) { const part = await reader.read(); if (part.done) break; size += part.value.length; if (size > 128000) throw new Error("Secretary response too large."); parts.push(part.value); } }
   finally { await reader.cancel().catch(() => {}); }
-  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts)));
+  const data = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(parts)));
+  if (!response.ok) {
+    if (response.status === 429) {
+      const header = response.headers.get("retry-after");
+      const seconds = header && /^\d+(?:\.\d+)?$/.test(header) ? Number(header) : header ? (Date.parse(header)-Date.now())/1000 : NaN;
+      throw new SecretaryProviderError("rate_limited", Number.isFinite(seconds) ? Math.max(1, Math.min(180, Math.ceil(seconds))) : 60);
+    }
+    throw new SecretaryProviderError(response.status === 400 && data?.error?.code === "json_validate_failed" ? "schema_rejected" : "provider_http_" + response.status, response.status >= 500 ? 30 : 0);
+  }
+  return data;
 }
 export async function inferSecretaryIntent(input: SecretaryModelInput, options: { apiKey?: string; model?: string; fetcher?: typeof fetch } = {}): Promise<SecretaryIntent> {
   if (!options.apiKey || input.text.length > 2000 || input.tasks.length > 80 || input.projects.length > 80) throw new Error("Secretary service unavailable.");
   reviewing(input);
   const model = options.model || "openai/gpt-oss-120b";
   const properties = Object.fromEntries(FIELD_NAMES.map(name => [name, { type: ["string", "null"], ...(name === "priority" ? { enum: ["red", "yellow", "green", null] } : {}) }]));
-  const result = await jsonResponse(await (options.fetcher || fetch)("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST", headers: { authorization: `Bearer ${options.apiKey}`, "content-type": "application/json" }, redirect: "error", signal: AbortSignal.timeout(18000),
-    body: JSON.stringify({ model, ...(model.startsWith("openai/gpt-oss-") ? { reasoning_effort: "low" } : {}), max_completion_tokens: 1300,
-      messages: [{ role: "system", content: PROMPT }, { role: "user", content: JSON.stringify(input) }],
+  const requestBody = { model, ...(model.startsWith("openai/gpt-oss-") ? { reasoning_effort: "low" } : {}), max_completion_tokens: 1300,
+      messages: [{ role: "system", content: plannerPrompt(input) }, { role: "user", content: JSON.stringify(plannerContext(input)) }],
       response_format: { type: "json_schema", json_schema: { name: "titanium_secretary_plan", strict: true, schema: {
         type: "object", additionalProperties: false, required: ["kind", "intakeMode", "action", "taskId", "projectId", "recipientIds", "fields", "message"], properties: {
           kind: { type: "string", enum: KINDS }, action: { type: ["string", "null"], enum: [...SECRETARY_ACTIONS, null] },
@@ -262,12 +282,24 @@ export async function inferSecretaryIntent(input: SecretaryModelInput, options: 
           recipientIds: { type: "array", items: { type: "string" } },
           fields: { type: "object", additionalProperties: false, required: FIELD_NAMES, properties },
         },
-      } } },
-    }),
-  }));
+      } } },};
+  const send = async (body: unknown) => {
+    try { return await jsonResponse(await (options.fetcher || fetch)("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST", headers: { authorization: `Bearer ${options.apiKey}`, "content-type": "application/json" },
+      redirect: "error", signal: AbortSignal.timeout(18000), body: JSON.stringify(body),
+    })); } catch (error) { if (error instanceof SecretaryProviderError) throw error; throw new SecretaryProviderError("provider_transport", 30); }
+  };
+  let result;
+  try { result = await send(requestBody); }
+  catch (error) {
+    if (!(error instanceof SecretaryProviderError) || error.code !== "schema_rejected") throw error;
+    // Never execute failed_generation. Fresh output still passes all server validators.
+    result = await send({ ...requestBody, response_format: { type: "json_object" },
+      messages: [{ role: "system", content: plannerPrompt(input) + "\nReturn JSON matching this exact schema: " + JSON.stringify(requestBody.response_format.json_schema.schema) }, requestBody.messages[1]] });
+  }
   const choice = result?.choices?.[0];
-  if (choice?.finish_reason !== "stop" || choice.message?.tool_calls || typeof choice.message?.content !== "string" || choice.message.content.length > 10000) throw new Error("Secretary service invalid response.");
-  return validateSecretaryIntent(JSON.parse(choice.message.content), input);
+  if (choice?.finish_reason !== "stop" || choice.message?.tool_calls || typeof choice.message?.content !== "string" || choice.message.content.length > 10000) throw new SecretaryProviderError("invalid_response");
+  try { return validateSecretaryIntent(JSON.parse(choice.message.content), input); } catch { throw new SecretaryProviderError("invalid_plan"); }
 }
 
 /** Separate public-search call. No task catalog, internal history or employee table is sent. */
