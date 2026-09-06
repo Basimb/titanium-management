@@ -74,7 +74,7 @@ test('task card colors are actual priority, never completion or lateness',()=>{
   ['red','completed',null,'🔴','قصوى'],['green','progress','2020-01-01','🟢','عادية'],['yellow','open',null,'🟡','متوسطة'],
  ]){
   const text=secretaryTaskCard({id:'t',projectId:'p',title:'مهمة',priority,status,dueDate},state,1788580000000);
-  assert.ok(text.startsWith(emoji));assert.match(text,new RegExp(`الأولوية: ${label}`));
+  assert.ok(text.startsWith('🔵 *مشروع*\n\n'+emoji+' *مهمة*'));assert.match(text,new RegExp(`الأولوية: ${label}`));
   if(priority==='green')assert.match(text,/متأخرة عن الموعد/);
  }
  assert.ok(secretaryTaskCard({id:'t',priority:'invalid'},state,1788580000000).startsWith('⚪'));
@@ -111,7 +111,7 @@ test('priority pagination declares counts, stays bounded and preserves every tas
  let text='المهام الحمراء';const seen=new Set();let pages=0;
  for(;;){
   const r=await run(text);pages++;assert.ok(r.reply.length<=3800);assert.match(r.reply,/المطابق ضمن صلاحياتك \(دون الأرشيف\): 19/);
-  for(const match of r.reply.matchAll(/^\d+\. 🔴 \*([^*]+)\*/gm)){assert.ok(!seen.has(match[1]));seen.add(match[1]);}
+  for(const match of r.reply.matchAll(/^🔴 \*((?:لوحة|تجربة قائمة \d+))\*/gm)){assert.ok(!seen.has(match[1]));seen.add(match[1]);}
   const next=/للتكملة اكتب: «([^»]+)»/.exec(r.reply);if(!next)break;text=next[1];assert.ok(pages<10);
  }
  assert.equal(seen.size,19);assert.ok(pages>=2);
