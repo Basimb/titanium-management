@@ -126,7 +126,7 @@ export function secretaryTaskCard(task: Task, state: Snapshot, now: number, deta
   const latest = state.comments.filter(c => c.taskId === task.id).sort((a, b) => b.createdAt - a.createdAt)[0];
   const priority = PRIORITIES[task.priority];
   const overdue = task.status !== "completed" && task.dueDate && task.dueDate < new Date(now + 3 * 3600_000).toISOString().slice(0, 10);
-  return `${project ? `🔵 *${clean(project.name, 90)}*\n\n` : ""}${priority?.icon || "⚪"} *${clean(task.title, 150)}*\n${LABELS[task.status] || clean(task.status)}${overdue ? " • متأخرة عن الموعد" : ""}\nالأولوية: ${priority?.label || "غير محددة"}\nالمسؤول: ${clean(task.owner || task.suggestedOwner || "لم يُعيّن")} ${task.dueDate ? `• الموعد: ${clean(task.dueDate, 10)}` : ""}${detailed ? `\nالمطلوب: ${clean(task.details || "لا توجد تفاصيل إضافية", 600)}${latest ? `\nآخر تحديث (${clean(latest.author, 50)}): ${clean(latest.body, 500)}` : "\nلا يوجد تحديث مسجّل بعد."}` : ""}`;
+  return `${project ? `🔵 *${clean(project.name, 90)}*\n\n` : ""}${priority?.icon || "⚪"} ${clean(task.title, 150)}\n${LABELS[task.status] || clean(task.status)}${overdue ? " • متأخرة عن الموعد" : ""}\nالأولوية: ${priority?.label || "غير محددة"}\nالمسؤول: ${clean(task.owner || task.suggestedOwner || "لم يُعيّن")} ${task.dueDate ? `• الموعد: ${clean(task.dueDate, 10)}` : ""}${detailed ? `\nالمطلوب: ${clean(task.details || "لا توجد تفاصيل إضافية", 600)}${latest ? `\nآخر تحديث (${clean(latest.author, 50)}): ${clean(latest.body, 500)}` : "\nلا يوجد تحديث مسجّل بعد."}` : ""}`;
 }
 function priorityReadReply(query: Extract<PriorityTaskQuery, { kind: "query" }>, state: Snapshot, now: number, text: string): { result: Result; scope: string[] } {
   const priority = PRIORITIES[query.priority];
