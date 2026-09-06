@@ -10,6 +10,7 @@ import { applyDecision, createProjectBundle, handleAgentIntent, type AgentResult
 import { listApprovals } from "./approvals.ts";
 import { activeRules } from "./rules.ts";
 import { searchKnowledge, formatKnowledgeHits } from "./knowledge.ts";
+import { migrateSecretaryMemory, rememberSecretaryMistake, recallSecretaryMemory, personalMemoryCommand, updatePersonalMemory, personalMemory } from "./secretary-memory.ts";
 import { enqueueAgentMessage } from "./agent-followups.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
 import { secretaryReviewRequest, isSecretaryIdentityQuery, SECRETARY_IDENTITY } from "./secretary-review.ts";
@@ -41,6 +42,7 @@ const eventKey = (event: Event) => hash([event.senderNumber, event.groupId, even
 const eventHash = (event: Event) => hash([event.senderNumber, event.groupId, event.text, event.replyToMessageId ?? null, event.responseMessageId ?? null, event.inputKind || "text", ...(event.choice ? [event.choice] : [])]);
 function transaction<T>(db: DatabaseSync, work: () => T): T { db.exec("BEGIN IMMEDIATE"); try { const result = work(); db.exec("COMMIT"); return result; } catch (error) { db.exec("ROLLBACK"); throw error; } }
 export function migrateSecretary(db: DatabaseSync) {
+  migrateSecretaryMemory(db);
   migrateManagementActions(db);
   migrateSecretaryOutbox(db);
   migrateSecretaryChoices(db);
@@ -362,6 +364,18 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const actor = actorFor(db, event, config); if (!actor) return { status: "denied", reply: "" };
   const initial = stateFor(db, actor); const previous = lookup(db, event, actor, initial); if (previous) return previous;
   const key = conversation(event, actor); const initialHash = fingerprint(initial);
+  const profileCommand = personalMemoryCommand(event.text);
+  if (profileCommand && actor.id === "basem" && actor.role === "admin" && event.groupId === null && !event.replyToMessageId) {
+    return transaction(db, () => {
+      const fresh = actorFor(db, event, config);
+      if (!config.enabled || !fresh || JSON.stringify(fresh) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
+      const duplicate = lookup(db, event, fresh, stateFor(db, fresh)); if (duplicate) return duplicate;
+      updatePersonalMemory(db, fresh.id, profileCommand, now);
+      return save(db, event, fresh, { status: "applied", reply: profileCommand.body === null
+        ? `حذفت «${profileCommand.topic}» من ذاكرتك الشخصية.`
+        : `حفظت في ذاكرتك الشخصية: ${profileCommand.topic} — ${profileCommand.body}\nتقدر تعدّل نفس الموضوع أو تقول «انس عني: ${profileCommand.topic}».` }, [], now);
+    });
+  }
   const pending = db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined;
   const storedIntake = intakeRow(db, key);
   const pendingDraft = pendingTaskDraft(pending, initialHash, now);
@@ -496,7 +510,13 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     pendingMessagePreview: pendingCommand?.action === "message_team" && typeof pendingCommand.text === "string" && Array.isArray(pendingCommand.recipientIds) ? { text: pendingCommand.text, recipientIds: pendingCommand.recipientIds } : null,
     tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status, priority: t.priority })),
     projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString(),
-    pendingApprovals: safeApprovals(db, actor), rules: safeRules(db) };
+    pendingApprovals: safeApprovals(db, actor), rules: safeRules(db),
+    personalContext: actor.id === "basem" && actor.role === "admin" && event.groupId === null ? personalMemory(db, actor.id) : [],
+    learningMemory: event.groupId === null ? recallSecretaryMemory(db, { conversation: key, role: actor.role,
+      query: review?.question || event.text, now,
+      allowedScope: new Set([...initial.tasks.map(t => "t:" + t.id), ...initial.projects.map(p => "p:" + p.id)]) }) : [],
+    knowledgeContext: event.groupId === null ? safeKnowledge(db, actor, review?.question || event.text)
+      .slice(0, 3).map(hit => ({ title: hit.title, snippet: hit.snippet.slice(0, 600) })) : [] };
   const directCreation = !review && event.inputKind !== "voice" && !event.replyToMessageId ? directTaskCreationIntent(input) : null;
   // A bare color can answer an active creation question; explicit list requests switch topic.
   const readQuestion = review?.question || event.text;
@@ -534,6 +554,9 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل أثناء قراءة رسالتك. ما عدّلتها؛ أعد الطلب لأراجع آخر وضع." }, [], now);
     if (hash(intakeRow(db, key) ?? null) !== hash(storedIntake ?? null)) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت مسودة المهمة أثناء قراءة رسالتك. لم أنشئ شيئًا؛ أعد آخر جواب لنكمل على التفاصيل الحالية." }, [], now);
     if ((plan.kind === "task_draft" || pendingDraft) && hash(db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) ?? null) !== hash(pending ?? null)) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت معاينة التأكيد أثناء قراءة رسالتك. لم أنشئ شيئًا؛ أعد التصحيح على المعاينة الحالية." }, [], now);
+    if (review && event.groupId === null) rememberSecretaryMistake(db, { conversation: key, role: freshActor.role,
+      question: review.question, answer: review.previousAnswer, now,
+      scope: [...initial.tasks.map(t => "t:" + t.id), ...initial.projects.map(p => "p:" + p.id)] });
     rememberPendingPreview(db, event, key, db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined);
     if (plan.kind === "task_draft") return taskIntake(db, event, freshActor, state, plan, key, taskDraft, now);
     // Only an explicit task_draft plan may continue intake; unrelated subjects cannot revive it later.
@@ -632,3 +655,4 @@ function deliverAgentSideEffects(db: DatabaseSync, actor: ChatUser, result: Agen
   for (const item of result.notify ?? []) if (item.userId !== actor.id) enqueueAgentMessage(db, { toUser: item.userId, text: item.text }, now);
   if (result.groupNotice) enqueueAgentMessage(db, { toUser: "group", text: result.groupNotice }, now);
 }
+

@@ -30,6 +30,32 @@ function command(action,fields={},taskId='t',projectId=null) { const p=emptySecr
 function teamMessage(text='الاجتماع بكرا الساعة 10',recipientIds=['all-team']) { const p=emptySecretaryIntent('message_team');p.fields.body=text;p.recipientIds=recipientIds;return p; }
 const pending = db => db.prepare('SELECT * FROM secretary_pending').get();
 
+test('owner personal preferences persist privately and can be replaced and forgotten',async t=>{
+ const f=fixture(t); const owner={senderNumber:'12025550103'};
+ const saved=await f.run(emptySecretaryIntent('chat'),{...owner,text:'احفظ عني: الردود: مختصرة'});
+ assert.equal(saved.status,'applied');
+ let seen;
+ await f.run(emptySecretaryIntent('chat'),{...owner,text:'مرحبا'},async input=>{seen=input;return emptySecretaryIntent('chat','أهلًا');});
+ assert.equal(seen.personalContext[0].body,'مختصرة');
+ await f.run(emptySecretaryIntent('chat'),{...owner,groupId:'12345@g.us',text:'مرحبا'},async input=>{seen=input;return emptySecretaryIntent('chat','أهلًا');});
+ assert.deepEqual(seen.personalContext,[]);
+ await f.run(emptySecretaryIntent('chat'),{text:'مرحبا'},async input=>{seen=input;return emptySecretaryIntent('chat','أهلًا');});
+ assert.deepEqual(seen.personalContext,[]);
+ await f.run(emptySecretaryIntent('chat'),{...owner,text:'انس عني: الردود'});
+ assert.equal(f.db.prepare('SELECT count(*) n FROM secretary_personal_memory').get().n,0);
+});
+
+test('a disputed private answer is recalled across days without turning criticism into an action',async t=>{
+ const f=fixture(t); const owner={senderNumber:'12025550103'};
+ await f.run(emptySecretaryIntent('chat','اقتراح سابق'),{...owner,text:'كيف أرتب اللوحات؟'});
+ await f.run(emptySecretaryIntent('chat','براجعها'),{...owner,text:'جوابك غلط'});
+ assert.equal(f.db.prepare('SELECT count(*) n FROM secretary_learning_memory').get().n,1);
+ f.tick(2*86400000);let seen;
+ await f.run(emptySecretaryIntent('chat'),{...owner,text:'كيف أرتب اللوحات؟'},async input=>{seen=input;return emptySecretaryIntent('chat','نراجع التفاصيل');});
+ assert.equal(seen.learningMemory.length,1);assert.equal(seen.learningMemory[0].disputedAnswer,'اقتراح سابق');
+ assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
+});
+
 test('secretary scoped friendly summary has direct link and no foreign data', async t=>{
  const f=fixture(t); const result=await f.run(); assert.equal(result.status,'summary'); assert.match(result.reply,/خالد/);assert.match(result.reply,/project=p&task=t/);assert.doesNotMatch(result.reply,/مهمة شادي|تفاصيل سرية/);
 });
@@ -404,3 +430,4 @@ test('duplicate message confirmation never enqueues twice; mapping changed after
  const s=getSecretaryOutboxStatus(f.db,{actor:{id:'basem',name:'باسم',role:'admin',active:1},origin:{senderNumber:manager.senderNumber,groupId:null}},f.config);
  assert.equal(s.recipientCount,1);
 });
+
