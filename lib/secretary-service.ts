@@ -534,8 +534,16 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     plan = priorityQuery ? emptySecretaryIntent(priorityQuery.kind === "clarify" ? "clarify" : "summary", priorityQuery.kind === "clarify" ? priorityQuery.reply : null)
       : directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
   } catch (error) {
-    if (!review) throw error;
-    plan = emptySecretaryIntent("clarify", "ما قدرت أكمل مراجعة الجواب الآن، وما بدي أخمّن أو أكرر نتيجة غير مؤكدة. حدد النقطة المختلف عليها لنراجعها؛ لم أنفّذ أي تغيير.");
+    // Only standalone, unqualified read questions may recover from provider failure.
+    // Never reinterpret a write, project filter, quoted reply, or active intake.
+    const generalTasks = event.text.normalize("NFKC").replace(/[أإآ]/g, "ا").replace(/[\u064B-\u065F\u0670ـ]/g, "").replace(/[؟?!.،,]/g, "").replace(/\s+/g, " ").trim();
+    if (!review && !event.replyToMessageId && !taskDraft
+      && /^(?:(?:شو|ايش|ما هي|اعرض|اعرضلي|وريني) )?(?:المهام(?: المطلوب[ةه]| المتاح[ةه]| الموجود[ةه])?|مهامي)(?: عندنا| عندي)?$/.test(generalTasks)) {
+      plan = emptySecretaryIntent("summary");
+    } else {
+      if (!review) throw error;
+      plan = emptySecretaryIntent("clarify", "ما قدرت أكمل مراجعة الجواب الآن، وما بدي أخمّن أو أكرر نتيجة غير مؤكدة. حدد النقطة المختلف عليها لنراجعها؛ لم أنفّذ أي تغيير.");
+    }
   }
   // Independent of the provider validator: criticism never grants a write/replay.
   if (review && !["summary", "details", "projects", "report", "help", "chat", "clarify", "search", "message_status"].includes(plan.kind)) {

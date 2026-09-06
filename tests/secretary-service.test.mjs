@@ -442,3 +442,16 @@ test('duplicate message confirmation never enqueues twice; mapping changed after
 
 
 
+test('general task question recovers from inference failure with scoped live data only',async t=>{
+ const f=fixture(t);const fail=async()=>{throw Error('provider unavailable');};
+ for(const text of ['شو المهام المطلوبه','شو المهام المطلوبة؟','شو مهامي؟']){
+   const r=await f.run(null,{text},fail);assert.equal(r.status,'summary');
+   assert.match(r.reply,/🔵 \*مشروع تجريبي\*/);assert.match(r.reply,/🔴 لوحة/);
+   assert.doesNotMatch(r.reply,/مهمة شادي|تفاصيل سرية|https?:/);
+ }
+ for(const text of ['احذف المهام','شو المهام المطلوبة في مشروع ثان','شو المهام المطلوبة بكرا']){
+   await assert.rejects(f.run(null,{text},fail),/provider unavailable/);
+ }
+ assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
+});
+
