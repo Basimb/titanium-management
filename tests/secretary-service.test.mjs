@@ -455,3 +455,11 @@ test('general task question recovers from inference failure with scoped live dat
  assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,2);
 });
 
+test('conversational lists enforce bold project headings with ordinary task names', async()=>{
+ const {formatSecretaryProjectHeadings}=await import('../lib/secretary-service.ts');
+ const state={projects:[{name:'مشروع تجريبي'}],tasks:[{title:'مهمة أولى'}]};
+ assert.equal(formatSecretaryProjectHeadings('🔵 مشروع تجريبي\n🔴 **مهمة أولى**',state),'🔵 *مشروع تجريبي*\n🔴 مهمة أولى');
+ assert.equal(formatSecretaryProjectHeadings('🔵 **مشروع تجريبي**:\n🟢 مهمة أولى',state),'🔵 *مشروع تجريبي*:\n🟢 مهمة أولى');
+ assert.equal(formatSecretaryProjectHeadings('ناقشنا مشروع تجريبي اليوم',state),'ناقشنا مشروع تجريبي اليوم');
+});
+

@@ -121,6 +121,17 @@ const PRIORITIES: Record<string, { icon: string; label: string; color: string }>
   yellow: { icon: "🟡", label: "متوسطة", color: "الصفراء" },
   green: { icon: "🟢", label: "عادية", color: "الخضراء" },
 };
+export function formatSecretaryProjectHeadings(reply: string, state: Pick<Snapshot, "projects" | "tasks">) {
+  return reply.split("\n").map(line => {
+    const plain = line.replace(/\*/g, "");
+    const content = plain.replace(/^\s*(?:(?:[-•]|\d+[.)])\s*)?(?:[🔵🔴🟡🟢⚪]\s*)?(?:المشروع:\s*)?/u, "");
+    const project = [...state.projects].sort((a, b) => b.name.length - a.name.length).find(p =>
+      content === p.name || content.startsWith(p.name + ":") || content.startsWith(p.name + " —") || content.startsWith(p.name + " -"));
+    if (project) return `🔵 *${project.name.replace(/\*/g, "")}*${content.slice(project.name.length)}`;
+    if (state.tasks.some(t => content === t.title || content.startsWith(t.title + " —") || content.startsWith(t.title + ":"))) return plain;
+    return line;
+  }).join("\n");
+}
 export function secretaryTaskCard(task: Task, state: Snapshot, now: number, detailed = false) {
   const project = state.projects.find(p => p.id === task.projectId);
   const latest = state.comments.filter(c => c.taskId === task.id).sort((a, b) => b.createdAt - a.createdAt)[0];
@@ -634,7 +645,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     }
     if (plan.kind === "chat" || plan.kind === "clarify" || plan.kind === "search") {
       let reply = publicReply || plan.message || "أي مهمة أو مشروع تقصد، وشو المطلوب؟";
-      if (plan.kind === "chat" || plan.kind === "clarify") reply = safeConversationalReply(reply);
+      if (plan.kind === "chat" || plan.kind === "clarify") reply = formatSecretaryProjectHeadings(safeConversationalReply(reply), state);
       // The planner explicitly identifies contextual replies; an unrelated topic has no focus.
       const contextTaskId = plan.kind !== "search" && state.tasks.some(task => task.id === plan.taskId) ? plan.taskId : null;
       return save(db, event, freshActor, { status: plan.kind === "clarify" ? "clarify" : "summary", reply, ...(contextTaskId ? { taskId: contextTaskId } : {}) }, plan.kind !== "search" ? [...state.tasks.map(t => "t:" + t.id), ...state.projects.map(p => "p:" + p.id)] : [], now);
