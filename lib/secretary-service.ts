@@ -428,7 +428,7 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   if (callerMatch && !event.replyToMessageId) {
     const projects = callerQuestion.includes("المشاريع") ? initial.projects : [];
     return earlyRead({ status: "summary", reply: `أهلًا ${clean(actor.name, 60)}، بعرفك من رقمك المسجّل عندنا.` + (callerQuestion.includes("المشاريع")
-      ? `\n\nالمشاريع المتاحة إلك:\n${projects.length ? projects.map(p => `🔵 *${clean(p.name, 100)}*\nالحالة: ${LABELS[p.status] || clean(p.status)}`).join("\n\n") : "ما في مشاريع متاحة حاليًا."}` : "") }, projects.map(p => "p:" + p.id));
+      ? `\n\n*المشاريع المتاحة إلك*\n\n${projects.length ? projects.map(p => `🔵 *${clean(p.name, 100)}*\nالحالة: ${LABELS[p.status] || clean(p.status)}`).join("\n\n") : "ما في مشاريع متاحة حاليًا."}` : "") }, projects.map(p => "p:" + p.id));
   }
   if (isSecretaryIdentityQuery(event.text)) return earlyRead({ status: "summary", reply: SECRETARY_IDENTITY });
   if (reviewRequest?.kind === "clarify") return earlyRead({ status: "clarify", reply: reviewRequest.reply });
