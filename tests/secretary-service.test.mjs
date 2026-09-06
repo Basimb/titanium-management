@@ -487,3 +487,13 @@ test('ordinary task listing bypasses unavailable provider without dropping filte
  assert.equal(called,true);
 });
 
+test('general summary groups all 25 short tasks under one bold heading without trailing spaces',async t=>{
+ const f=fixture(t);
+ f.db.prepare("DELETE FROM tasks WHERE id='private'").run();
+ for(let i=2;i<=25;i++)f.db.prepare("INSERT INTO tasks(id,project_id,title,details,priority,status,owner,suggested_owner,created_at,updated_at) VALUES(?, 'p', ?, '', 'green', 'open', NULL, 'خالد', 1, 1)").run('grouped-'+i,'مهمة تجريبية '+i);
+ const r=await f.run(null,{text:'وريني المهام كلها كمان مره'},async()=>assert.fail());
+ assert.equal((r.reply.match(/🔵 \*مشروع تجريبي\*/g)||[]).length,1);
+ assert.match(r.reply,/مهمة تجريبية 25/);assert.match(r.reply,/جميع المهام \(25\)/);
+ assert.doesNotMatch(r.reply,/&#x20;| +\n|\*مهمة/);assert.ok(r.reply.length<4000);
+});
+

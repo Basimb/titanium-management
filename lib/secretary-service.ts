@@ -180,7 +180,23 @@ function readReply(plan: SecretaryIntent, actor: ChatUser, state: Snapshot, now:
   const pending = tasks.filter(t => t.status === "approval");
   const header = plan.kind === "report" ? `📋 *ملخص الإدارة*\nالمشاريع: ${state.projects.length}\nمعتمدة: ${tasks.filter(t => t.status === "completed").length}\nقيد التنفيذ: ${tasks.filter(t => t.status === "progress").length}\nبانتظار باسم: ${pending.length}\nمتأخرة بموعد مسجل: ${overdue.length}\nبدون موعد: ${tasks.filter(t => !t.dueDate && t.status !== "completed").length}\n🔴 قصوى: ${tasks.filter(t => t.priority === "red").length} • 🟡 متوسطة: ${tasks.filter(t => t.priority === "yellow").length} • 🟢 عادية: ${tasks.filter(t => t.priority === "green").length}\n` : `${greeting}المهام المتاحة إلك: ${tasks.length}\n`;
   const ordered = [...tasks].sort((a, b) => Number(overdue.includes(b)) - Number(overdue.includes(a)) || Number(pending.includes(b)) - Number(pending.includes(a)));
-  return { result: { status: "summary", reply: `${header}\n${ordered.slice(0, 6).map(t => secretaryTaskCard(t, state, now)).join("\n\n")}${tasks.length > 6 ? `\n\nحدد مشروعًا أو أولوية لأعرض بقية المهام.` : ""}${tasks.length === 0 ? "ما في مهام متاحة إلك حاليًا." : ""}` }, scope: tasks.map(t => "t:" + t.id) };
+  let body = "", shown = 0;
+  const groups = new Map<string, Task[]>();
+  for (const task of ordered) { const group = groups.get(task.projectId) || []; group.push(task); groups.set(task.projectId, group); }
+  outer: for (const [projectId, group] of groups) {
+    const name = state.projects.find(p => p.id === projectId)?.name || "مشروع غير محدد";
+    let section = `\n\n🔵 *${clean(name, 100).replace(/\*/g, "")}*`;
+    for (const task of group) {
+      const priority = PRIORITIES[task.priority];
+      const days = task.status !== "completed" && task.dueDate && task.dueDate < today ? Math.floor((Date.parse(today) - Date.parse(task.dueDate)) / 86400000) : 0;
+      const item = `\n\n${priority?.icon || "⚪"} ${clean(task.title, 150).replace(/\*/g, "")}\n${LABELS[task.status] || clean(task.status)} • ${clean(task.owner || task.suggestedOwner || "غير معيّن", 50)}${days ? ` • 🔴 متأخرة ${days} يوم` : task.dueDate ? ` • الموعد: ${clean(task.dueDate, 10)}` : ""}`;
+      if (header.length + body.length + section.length + item.length > 3500) break outer;
+      section += item; shown++;
+      body += section; section = "";
+    }
+  }
+  const footer = shown < tasks.length ? `\n\nعرضت ${shown} من ${tasks.length} بسبب طول الرسالة. حدد اسم مشروع لأعرض مهامه.` : tasks.length ? `\n\nتم عرض جميع المهام (${shown}).` : "\nما في مهام متاحة إلك حاليًا.";
+  return { result: { status: "summary", reply: header.trimEnd() + body + footer }, scope: tasks.map(t => "t:" + t.id) };
 }
 function commandFrom(plan: SecretaryIntent, state: Snapshot): Record<string, unknown> {
   const command: Record<string, unknown> = { action: plan.action };
