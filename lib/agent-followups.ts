@@ -97,6 +97,7 @@ function nextQueued(db: DatabaseSync, config: FollowupConfig, at: number): Plann
 }
 
 export function createFollowupJobs({ db, config, now = Date.now }: { db: DatabaseSync; config: FollowupConfig | (() => FollowupConfig); now?: () => number }) {
+  migrateManagementActions(db);
   let running = false;
   const current = () => typeof config === "function" ? config() : config;
   return {
@@ -125,3 +126,4 @@ export function createFollowupJobs({ db, config, now = Date.now }: { db: Databas
     },
   };
 }
+

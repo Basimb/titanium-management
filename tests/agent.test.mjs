@@ -16,6 +16,14 @@ const shadi = { id: "shadi", name: "شادي", role: "member", active: 1 };
 const manager = { id: "mgr", name: "مدير القسم", role: "manager", active: 1 };
 const T0 = 1_760_000_000_000;
 
+test('followup worker initializes queue tables before first delivery on an upgraded database', async t => {
+  const db = fixture(t);
+  db.exec('DROP TABLE agent_outbox; DROP TABLE agent_followups;');
+  const jobs = createFollowupJobs({ db, config: { enabled: true, contacts: [] }, now: () => Date.parse('2026-09-06T20:00:00Z') });
+  assert.deepEqual(await jobs.deliverNext(async () => assert.fail('No message expected outside working hours')), { status: 'idle' });
+  assert.equal(db.prepare('SELECT count(*) AS n FROM agent_outbox').get().n, 0);
+});
+
 function fixture(t) {
   const db = new DatabaseSync(":memory:");
   t.after(() => db.close());
@@ -207,3 +215,4 @@ test("follow-ups: overdue owner nudge once per day, stale approval to owner, dig
   assert.ok(groupBudgetRemaining(db, at + 60_000) < 12);
   assert.ok(isGroupWorthy("create", "project") && !isGroupWorthy("comment", "task"));
 });
+
