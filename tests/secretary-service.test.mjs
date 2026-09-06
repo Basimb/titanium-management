@@ -463,3 +463,19 @@ test('conversational lists enforce bold project headings with ordinary task name
  assert.equal(formatSecretaryProjectHeadings('ناقشنا مشروع تجريبي اليوم',state),'ناقشنا مشروع تجريبي اليوم');
 });
 
+test('project test request survives model start metadata and confirms once without team notices',async t=>{
+ const f=fixture(t);
+ const plan=emptySecretaryIntent('project_draft');plan.intakeMode='start';plan.fields.name='تجربة السكرتير';plan.message='اختبار فقط | - | green | -';
+ const preview=await f.run(plan,{senderNumber:'12025550103',text:'افتح مشروع اسمه تجربة السكرتير، فيه مهمة اختبار فقط، ولا تبعت أي رسالة للفريق'});
+ assert.equal(preview.status,'confirmation');assert.match(preview.reply,/بدون إرسال إشعارات/);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM projects').get().n,2);
+ const token=pending(f.db).token;
+ const event=f.event({senderNumber:'12025550103',text:'موافق '+token});
+ const run=()=>handleSecretaryEvent(f.db,event,f.config,{now:()=>f.now,infer:async()=>assert.fail('confirmation must not infer')});
+ const result=await run();assert.equal(result.status,'applied');await run();
+ assert.equal(f.db.prepare('SELECT count(*) n FROM projects').get().n,3);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM tasks').get().n,3);
+ assert.equal(f.db.prepare('SELECT count(*) n FROM agent_outbox').get().n,0);
+});
+
+

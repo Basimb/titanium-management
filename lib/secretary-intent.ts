@@ -140,6 +140,9 @@ function incompleteWork(text: string) {
 }
 export function validateSecretaryIntent(value: unknown, input: SecretaryModelInput): SecretaryIntent {
   const review = reviewing(input);
+  // A project draft always has its own preview; task-intake metadata grants no authority.
+  // Some models emit start for both draft kinds. Canonicalize only this harmless alias.
+  if (object(value) && value.kind === "project_draft" && value.intakeMode === "start") value = { ...value, intakeMode: null };
   if (!object(value) || !keys(value, ["kind", "intakeMode", "action", "taskId", "projectId", "recipientIds", "fields", "message"]) || !KINDS.includes(String(value.kind))
     || !(value.action === null || SECRETARY_ACTIONS.includes(value.action as never)) || !object(value.fields) || !keys(value.fields, FIELD_NAMES)) throw new Error("Invalid secretary plan.");
   for (const [name, val] of Object.entries(value.fields)) if (!(val === null || (typeof val === "string" && val.length <= (name === "body" || name === "details" ? 2000 : 240)))) throw new Error("Invalid secretary fields.");

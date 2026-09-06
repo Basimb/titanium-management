@@ -13,7 +13,7 @@ import type { SecretaryIntent } from "./secretary-intent.ts";
 
 export type AgentResult = { status: string; reply: string; taskId?: string; groupNotice?: string | null; notify?: Array<{ userId: string; text: string }> };
 export type AgentContext = {
-  db: DatabaseSync; actor: ManagementActor; now: number; inputKind?: string | null;
+  db: DatabaseSync; actor: ManagementActor; now: number; inputKind?: string | null; suppressNotices?: boolean;
   users: Array<{ id: string; name: string; active?: number }>; tasks: Array<{ id: string; title: string; projectId: string; status: string; owner: string | null; dueDate: string | null }>;
   projects: Array<{ id: string; name: string; status: string }>;
   /** Store a pending command for the existing confirmation flow (token returned). */
@@ -44,7 +44,7 @@ export function describeProjectBundle(name: string, goal: string, tasks: Project
 }
 
 /** Execute a confirmed project bundle (owner) — called from the confirmation flow. */
-export function createProjectBundle(db: DatabaseSync, actor: ManagementActor, bundle: { name: string; goal: string; tasks: ProjectDraftTask[] }, now: number, context: Record<string, unknown>): AgentResult {
+export function createProjectBundle(db: DatabaseSync, actor: ManagementActor, bundle: { name: string; goal: string; tasks: ProjectDraftTask[]; suppressNotices?: boolean }, now: number, context: Record<string, unknown>): AgentResult {
   const created = executeManagementAction(db, actor, { action: "add_project", name: bundle.name }, { now, source: "whatsapp_secretary", auditContext: context });
   let count = 0;
   for (const task of bundle.tasks) {
@@ -53,7 +53,7 @@ export function createProjectBundle(db: DatabaseSync, actor: ManagementActor, bu
   }
   const nameOf = (id: string | null) => id ? String(db.prepare("SELECT name FROM users WHERE id=?").get(id)?.name ?? id) : null;
   const lines = bundle.tasks.map(task => `${nameOf(task.ownerId) ?? "غير معيّن"}: ${task.title} — ${task.priority === "red" ? "أحمر" : task.priority === "yellow" ? "أصفر" : "أخضر"}${task.dueDate ? ` — ${task.dueDate}` : ""}`);
-  return { status: "applied", reply: `✅ أنشأت مشروع «${clean(bundle.name)}» مع ${count} مهام.`, groupNotice: `📁 مشروع جديد: ${clean(bundle.name)}${lines.length ? `\n${lines.join("\n")}` : ""}` };
+  return { status: "applied", reply: `✅ أنشأت مشروع «${clean(bundle.name)}» مع ${count} مهام.${bundle.suppressNotices ? " بدون إرسال إشعارات للفريق." : ""}`, groupNotice: bundle.suppressNotices ? null : `📁 مشروع جديد: ${clean(bundle.name)}${lines.length ? `\n${lines.join("\n")}` : ""}` };
 }
 
 /** Execute a confirmed decision (owner, voice path) — called from the confirmation flow. */
@@ -166,8 +166,8 @@ export function handleAgentIntent(plan: SecretaryIntent, ctx: AgentContext): Age
         const preview = describeProjectBundle(name, goal, parsed.tasks, ctx.users);
         const warnings = [...parsed.problems, ...violations].map(problem => `⚠️ ${problem}`).join("\n");
         if (owner) {
-          const token = ctx.stash({ action: "create_project_bundle", name, goal, tasks: parsed.tasks });
-          return { status: "confirmation", reply: `${voice ? "فهمت من الصوت:\n" : ""}${preview}${warnings ? `\n${warnings}` : ""}\n\nأعتمد إنشاء المشروع؟ اكتب «موافق ${token}» أو صحّح أي بند.` };
+          const token = ctx.stash({ action: "create_project_bundle", name, goal, tasks: parsed.tasks, suppressNotices: ctx.suppressNotices === true });
+          return { status: "confirmation", reply: `${voice ? "فهمت من الصوت:\n" : ""}${preview}${warnings ? `\n${warnings}` : ""}${ctx.suppressNotices ? "\nبدون إرسال إشعارات للفريق." : ""}\n\nأعتمد إنشاء المشروع؟ اكتب «موافق ${token}» أو صحّح أي بند.` };
         }
         const request = requestProjectCreate(db, actor, { name, goal, tasks: parsed.tasks }, { now });
         return { status: "applied", reply: `📨 رفعت اقتراح المشروع «${name}» لباسم للاعتماد.`, notify: [{ userId: "basem", text: request.ownerMessage }], groupNotice: null };
@@ -181,3 +181,4 @@ export function handleAgentIntent(plan: SecretaryIntent, ctx: AgentContext): Age
 }
 
 export function rulesSummary(db: DatabaseSync): string { return formatRules(activeRules(db)); }
+
