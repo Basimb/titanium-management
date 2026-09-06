@@ -7,7 +7,7 @@ import { loadConfig } from './config.mjs';
 const SETTINGS_KEYS = new Set(['TEAM_CHAT_ENABLED', 'TEAM_CHAT_SHARED_KEY', 'TEAM_CHAT_CONTACTS_JSON',
   'TEAM_CHAT_GROUP_IDS_JSON', 'GROQ_API_KEY', 'GROQ_MODEL', 'WHATSAPP_LOGIN_ENABLED',
   'WHATSAPP_LOGIN_SECRET', 'WHATSAPP_LOGIN_DATABASE', 'WHATSAPP_LOGIN_ORIGIN',
-  'SECRETARY_ENABLED', 'SECRETARY_WEB_ENABLED', 'SECRETARY_VOICE_ENABLED', 'SECRETARY_FOLLOWUP_ENABLED', 'TITANIUM_PUBLIC_URL']);
+  'SECRETARY_ENABLED', 'SECRETARY_WEB_ENABLED', 'SECRETARY_VOICE_ENABLED', 'SECRETARY_FOLLOWUP_ENABLED', 'TITANIUM_PUBLIC_URL', 'DASHBOARD_READONLY']);
 const MAX_BYTES = 32_768;
 const SERVICE_DIRECTORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -240,3 +240,4 @@ export async function launchPrivate({ env = process.env, args = process.argv.sli
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   process.exitCode = await launchPrivate();
 }
+
