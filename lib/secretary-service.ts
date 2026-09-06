@@ -156,7 +156,7 @@ function priorityReadReply(query: Extract<PriorityTaskQuery, { kind: "query" }>,
 function readReply(plan: SecretaryIntent, actor: ChatUser, state: Snapshot, now: number): { result: Result; scope: string[] } {
   const greeting = `أهلًا يا ${clean(actor.name, 60)}، `;
   if (plan.kind === "help") return { result: { status: "summary", reply: `${greeting}${SECRETARY_IDENTITY}\nاحكيلي بطريقتك: شو مهامي؟ اشرح المهمة، سجل تحديث، أو افتح مشروعًا (لباسم). وإذا قلت «جوابك غلط» براجع السؤال وجوابي على ضوء المعلومات المتاحة، وبستوضح أي نقص.\nالدخول للموقع برمز خاص على واتسابك المسجّل:\n${ORIGIN}/` }, scope: [] };
-  if (plan.kind === "projects") return { result: { status: "summary", reply: greeting + (state.projects.length ? state.projects.slice(0, 16).map(p => `🔵 *${clean(p.name, 100)}* — ${LABELS[p.status] || clean(p.status)}\n${ORIGIN}/?project=${encodeURIComponent(p.id)}`).join("\n\n") : "ما في مشاريع متاحة إلك حاليًا.") }, scope: state.projects.map(p => "p:" + p.id) };
+  if (plan.kind === "projects") return { result: { status: "summary", reply: greeting + "\n\n*المشاريع المتاحة إلك*\n\n" + (state.projects.length ? state.projects.slice(0, 16).map(p => `🔵 *${clean(p.name, 100)}* — ${LABELS[p.status] || clean(p.status)}\n${ORIGIN}/?project=${encodeURIComponent(p.id)}`).join("\n\n") : "ما في مشاريع متاحة إلك حاليًا.") }, scope: state.projects.map(p => "p:" + p.id) };
   if (plan.kind === "details") {
     const task = state.tasks.find(t => t.id === plan.taskId);
     if (task) return { result: { status: "summary", reply: `${greeting}\n${secretaryTaskCard(task, state, now, true)}\n\nاحكيلي شو صار معك أو شو بدك أعمل عليها.`, taskId: task.id }, scope: ["t:" + task.id, "p:" + task.projectId] };
