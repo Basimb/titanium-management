@@ -50,3 +50,9 @@ test('second model gets only public question and tool evidence; failure preserve
   assert.match(reply,/الأدلة غير كافية/);assert.match(reply,/https:\/\/example.org\/source/);
 });
 
+test('live provider rejection returns honest unverified status without a fake second review',async()=>{
+ let calls=0;
+ const answer=await searchSecretaryWeb('public question',{apiKey:'synthetic',fetcher:async()=>{calls++;return Response.json({error:{code:'request_too_large'}},{status:413});}});
+ assert.equal(calls,1);assert.match(answer,/ما قدرت أتحقق/);assert.doesNotMatch(answer,/https:\/\//);
+});
+
