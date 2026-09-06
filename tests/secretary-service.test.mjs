@@ -479,3 +479,11 @@ test('project test request survives model start metadata and confirms once witho
 });
 
 
+test('ordinary task listing bypasses unavailable provider without dropping filters',async t=>{
+ const f=fixture(t);
+ const r=await f.run(null,{text:'وريني المهام كلها كمان مره'},async()=>assert.fail('list does not need inference'));
+ assert.equal(r.status,'summary');assert.match(r.reply,/لوحة/);assert.doesNotMatch(r.reply,/مهمة شادي/);
+ let called=false;await f.run(null,{text:'وريني المهام كلها بكرا'},async()=>{called=true;return emptySecretaryIntent('clarify','أي موعد؟')});
+ assert.equal(called,true);
+});
+

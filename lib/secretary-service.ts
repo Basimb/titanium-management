@@ -541,9 +541,12 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const priorityQuery = review ? priorityTaskQuery(readQuestion, input)
     : !event.replyToMessageId && (!taskDraft || /مهام|اعط|أعط|وريني|اعرض|اسرد/u.test(event.text)) ? priorityTaskQuery(event.text, input) : null;
   let plan: SecretaryIntent;
+  const listText = event.text.normalize("NFKC").replace(/[أإآ]/g, "ا").replace(/[\u064B-\u065F\u0670ـ؟?!.،,]/g, "").replace(/\s+/g, " ").trim();
+  const directTaskList = !review && !taskDraft && !event.replyToMessageId
+    && /^(?:وريني|اعرض|اعرضلي|اعطيني|شو) المهام(?: المطلوبة| المطلوبه| المتاحة| المتاحه| الموجودة| الموجوده)?(?: كلها| جميعها)?(?: كمان مره| كمان مرة| مرة ثانية| مره ثانيه)?$/.test(listText);
   try {
     plan = priorityQuery ? emptySecretaryIntent(priorityQuery.kind === "clarify" ? "clarify" : "summary", priorityQuery.kind === "clarify" ? priorityQuery.reply : null)
-      : directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
+      : directTaskList ? emptySecretaryIntent("summary") : directCreation ?? validateSecretaryIntent(await dependencies.infer(input), input);
   } catch (error) {
     // Only standalone, unqualified read questions may recover from provider failure.
     // Never reinterpret a write, project filter, quoted reply, or active intake.
