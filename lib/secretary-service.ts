@@ -5,6 +5,12 @@ import { resolveChatUser, normalizeContactNumber, type ChatUser } from "./team-c
 import type { TeamChatConfig, TeamChatEnvelope } from "./team-chat-gateway.ts";
 import { directTaskCreationIntent, emptySecretaryIntent, validateSecretaryIntent, type SecretaryIntent, type SecretaryModelInput } from "./secretary-intent.ts";
 import { priorityTaskQuery, type PriorityTaskQuery } from "./secretary-priority-query.ts";
+import { AGENT_KINDS } from "./secretary-intent.ts";
+import { applyDecision, createProjectBundle, handleAgentIntent, type AgentResult } from "./secretary-agent.ts";
+import { listApprovals } from "./approvals.ts";
+import { activeRules } from "./rules.ts";
+import { searchKnowledge, formatKnowledgeHits } from "./knowledge.ts";
+import { enqueueAgentMessage } from "./agent-followups.ts";
 import { safeConversationalReply } from "./secretary-conversation-policy.ts";
 import { secretaryReviewRequest, isSecretaryIdentityQuery, SECRETARY_IDENTITY } from "./secretary-review.ts";
 import { migrateSecretaryOutbox, getSecretaryOutboxRecipients, createSecretaryOutboxPreview, confirmSecretaryOutboxPreview, getSecretaryOutboxStatus, secretaryOutboxDeliveryLabel, SecretaryOutboxError } from "./secretary-outbox.ts";
@@ -470,6 +476,15 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
         } catch (error) { if (!(error instanceof SecretaryOutboxError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
       }
       if (command.action === "schedule_reminder") return reminder(db, event, freshActor, state, command.taskId, command.dueAt, now);
+      if (command.action === "create_project_bundle" || command.action === "decide_approval") {
+        try {
+          const result = command.action === "create_project_bundle"
+            ? createProjectBundle(db, freshActor, { name: String(command.name), goal: String(command.goal ?? ""), tasks: Array.isArray(command.tasks) ? command.tasks : [] }, now, { originalText: live.original_text, sourceMessageId: live.source_message_id, confirmationRequired: true, confirmedBy: freshActor.id, confirmationMessageId: event.messageId, senderNumber: event.senderNumber, origin: "whatsapp" })
+            : applyDecision(db, freshActor, { approvalId: String(command.approvalId), decision: command.decision === "approved" ? "approved" : "rejected", note: typeof command.note === "string" ? command.note : undefined }, now);
+          deliverAgentSideEffects(db, freshActor, result, now);
+          return save(db, event, freshActor, { status: result.status, reply: result.reply }, [], now);
+        } catch (error) { if (!(error instanceof ManagementActionError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
+      }
       return perform(db, event, freshActor, state, command, now, { originalText: live.original_text, sourceMessageId: live.source_message_id, confirmationRequired: true, confirmedBy: freshActor.id, confirmationMessageId: event.messageId });
     });
   }
@@ -480,7 +495,8 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
     canMessageTeam, messageRecipients: canMessageTeam ? getSecretaryOutboxRecipients(db, config).map(user => ({ id: user.userId, name: user.name })) : [],
     pendingMessagePreview: pendingCommand?.action === "message_team" && typeof pendingCommand.text === "string" && Array.isArray(pendingCommand.recipientIds) ? { text: pendingCommand.text, recipientIds: pendingCommand.recipientIds } : null,
     tasks: initial.tasks.map(t => ({ id: t.id, title: t.title, projectId: t.projectId, status: t.status, priority: t.priority })),
-    projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString() };
+    projects: initial.projects.map(p => ({ id: p.id, name: p.name, status: p.status })), users: initial.users.filter(u => u.active === 1).map(u => ({ id: u.id, name: u.name })), history, now: new Date(now).toISOString(),
+    pendingApprovals: safeApprovals(db, actor), rules: safeRules(db) };
   const directCreation = !review && event.inputKind !== "voice" && !event.replyToMessageId ? directTaskCreationIntent(input) : null;
   // A bare color can answer an active creation question; explicit list requests switch topic.
   const readQuestion = review?.question || event.text;
@@ -501,7 +517,9 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   let publicReply: string | null = null;
   if (plan.kind === "search") {
     const query = readQuestion.trim(); // Exact current/prior user question, not plan.message.
-    if (privateSearchQuestion(query, initial)) publicReply = "هذا السؤال قد يتضمن معلومات داخلية؛ ما أرسلته لبحث عام. حدد المهمة أو المعلومة العامة المطلوبة بدون بيانات خاصة.";
+    const internal = review ? [] : safeKnowledge(db, actor, query);
+    if (internal.length) publicReply = `من قاعدة المعرفة الداخلية:\n\n${formatKnowledgeHits(internal)}\n\n(قل «ابحث على الإنترنت» إذا بدك مصادر عامة.)`;
+    else if (privateSearchQuestion(query, initial)) publicReply = "هذا السؤال قد يتضمن معلومات داخلية؛ ما أرسلته لبحث عام. حدد المهمة أو المعلومة العامة المطلوبة بدون بيانات خاصة.";
     else if (!dependencies.search) publicReply = "البحث العام غير مفعّل حاليًا؛ ما عملت بحثًا. أقدر أراجع بيانات الموقع أو أوضح ما يلزم للتحقق.";
     else try { publicReply = await dependencies.search(query); }
     catch (error) {
@@ -548,6 +566,12 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
         return save(db, event, freshActor, { status: "confirmation", batchId: preview.batchId, reply }, [], now);
       } catch(error) { if (!(error instanceof SecretaryOutboxError)) throw error; return save(db, event, freshActor, { status: "clarify", reply: error.message }, [], now); }
     }
+    if (AGENT_KINDS.has(plan.kind)) {
+      db.prepare("DELETE FROM secretary_pending WHERE conversation_key=?").run(key);
+      const result = handleAgentIntent(plan, { db, actor: freshActor, now, inputKind: event.inputKind, users: state.users, tasks: state.tasks, projects: state.projects,
+        stash: command => { const token = "T" + randomBytes(3).toString("hex").toUpperCase(); db.prepare("INSERT INTO secretary_pending VALUES(?,?,?,?,?,?,?)").run(key, token, JSON.stringify(command), initialHash, event.text, event.messageId, now + CONFIRM_MS); log(db, freshActor, event, "secretary_proposal", { summary: "عرض تغييرًا ينتظر التأكيد", proposedCommand: command, confirmationRequired: true }, now); return token; } });
+      if (result) { deliverAgentSideEffects(db, freshActor, result, now); return save(db, event, freshActor, { status: result.status, reply: result.reply, ...(result.taskId ? { taskId: result.taskId } : {}) }, result.taskId ? ["t:" + result.taskId] : [], now); }
+    }
     if (plan.kind === "command") {
       const command = commandFrom(plan, state);
       if (freshActor.id !== "basem" && !["claim", "cancel_claim", "comment", "submit"].includes(String(command.action))) return save(db, event, freshActor, { status: "denied", reply: "هذا القرار من صلاحيات باسم. أقدر أساعدك بتحديث مهامك أو إرسالها للمراجعة." }, [], now);
@@ -592,4 +616,19 @@ function perform(db: DatabaseSync, event: Event, actor: ChatUser, state: Snapsho
     if (!(error instanceof ManagementActionError)) throw error;
     return save(db, event, actor, { status: "clarify", reply: error.message }, [], now);
   }
+}
+
+function safeApprovals(db: DatabaseSync, actor: ChatUser) {
+  try { return listApprovals(db, actor, { status: "pending", limit: 20 }).map(a => ({ id: a.id, type: a.type, summary: a.summary, requestedBy: a.requestedByName })); } catch { return []; }
+}
+function safeRules(db: DatabaseSync) {
+  try { return activeRules(db).slice(0, 30).map(rule => ({ id: rule.id, statement: rule.statement })); } catch { return []; }
+}
+function safeKnowledge(db: DatabaseSync, actor: ChatUser, query: string) {
+  try { return searchKnowledge(db, actor, query, 3); } catch { return []; }
+}
+/** Private notifications and group notices produced by agent actions go to the durable queue; the bridge delivers them. */
+function deliverAgentSideEffects(db: DatabaseSync, actor: ChatUser, result: AgentResult, now: number) {
+  for (const item of result.notify ?? []) if (item.userId !== actor.id) enqueueAgentMessage(db, { toUser: item.userId, text: item.text }, now);
+  if (result.groupNotice) enqueueAgentMessage(db, { toUser: "group", text: result.groupNotice }, now);
 }

@@ -2,8 +2,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { withAbortSignal } from './group-privacy.mjs';
 import { selectIncoming } from './identity.mjs';
 
-export const MAX_VOICE_BYTES = 2 * 1024 * 1024;
-export const MAX_VOICE_SECONDS = 60;
+export const MAX_VOICE_BYTES = 10 * 1024 * 1024;
+export const MAX_VOICE_SECONDS = 300;
 
 export function validVoiceMetadata(audio) {
   if (!audio || audio.ptt !== true || typeof audio.mimetype !== 'string' ||
