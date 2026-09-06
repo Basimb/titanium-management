@@ -201,7 +201,10 @@ export default function Dashboard() {
   }, []);
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 60000); return () => window.clearInterval(timer); }, []);
   useEffect(() => {
-    const update = () => setTvMode(new URLSearchParams(window.location.search).get("display") === "tv");
+    const update = () => {
+      const params = new URLSearchParams(window.location.search);
+      setTvMode(params.get("display") === "tv" || (params.get("display") !== "list" && !params.has("project") && !params.has("task")));
+    };
     update(); window.addEventListener("popstate", update);
     return () => window.removeEventListener("popstate", update);
   }, []);
@@ -224,7 +227,9 @@ export default function Dashboard() {
   }, [tvMode, currentUser?.id]);
   function toggleTV(enabled:boolean) {
     const url = new URL(window.location.href);
-    if (enabled) url.searchParams.set("display", "tv"); else url.searchParams.delete("display");
+    if (enabled) {
+      url.searchParams.delete("display"); url.searchParams.delete("project"); url.searchParams.delete("task");
+    } else url.searchParams.set("display", "list");
     window.history.pushState(null, "", `${url.pathname}${url.search}`);
     setTvMode(enabled);
   }
@@ -423,3 +428,4 @@ function MonitoringPanel({ monitoring, tasks, projects, now, isAdmin, onDecide }
     </div>
   </section>;
 }
+
