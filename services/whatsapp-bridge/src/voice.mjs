@@ -78,10 +78,12 @@ export function createVoiceTranscriber({ apiKey, downloadContent, fetcher = fetc
     if (!validVoiceMetadata(audio) || typeof authorize !== 'function') throw new Error('voice_not_eligible');
     const signal = AbortSignal.timeout(15_000);
     let stream, audioBuffer;
+    let stage = 'authorization';
     const chunks = [];
     try {
       if (!await withAbortSignal(authorize, signal)) throw new Error('voice_unauthorized');
       // Pin the CDN host, refuse redirects, and let an abort stop the streaming fetch.
+      stage = 'download';
       stream = await withAbortSignal(() => downloadContent(audio, 'audio', {
         host: 'mmg.whatsapp.net', options: { signal, redirect: 'error' },
       }), signal);
@@ -98,6 +100,7 @@ export function createVoiceTranscriber({ apiKey, downloadContent, fetcher = fetc
         }, signal);
       } finally { signal.removeEventListener('abort', abortStream); }
       audioBuffer = Buffer.concat(chunks);
+      stage = 'validation';
       if (!timingSafeEqual(createHash('sha256').update(audioBuffer).digest(), Buffer.from(audio.fileSha256))) throw new Error('voice_integrity_failed');
       opusDuration(audioBuffer);
       // Recheck current active sender + all current group members BEFORE upload to Groq.
@@ -108,6 +111,7 @@ export function createVoiceTranscriber({ apiKey, downloadContent, fetcher = fetc
       form.set('language', 'ar');
       form.set('temperature', '0');
       form.set('response_format', 'verbose_json');
+      stage = 'transcription';
       const response = await withAbortSignal(() => fetcher('https://api.groq.com/openai/v1/audio/transcriptions', {
         method: 'POST', headers: { authorization: `Bearer ${apiKey}` }, body: form, signal, redirect: 'error',
       }), signal);
@@ -132,6 +136,9 @@ export function createVoiceTranscriber({ apiKey, downloadContent, fetcher = fetc
       const text = safeVoiceTranscript(result?.text);
       if (!text || typeof result?.duration !== 'number' || result.duration <= 0 || result.duration > MAX_VOICE_SECONDS) throw new Error('voice_transcript_rejected');
       return text;
+    } catch (error) {
+      const known = new Set(['voice_unauthorized','voice_too_large','voice_integrity_failed','voice_duration_exceeded','voice_transcription_unavailable','voice_response_too_large','voice_transcript_rejected']);
+      throw new Error(known.has(error?.message) ? error.message : `voice_${stage}_failed`);
     } finally {
       stream?.destroy?.();
       audioBuffer?.fill(0);
@@ -151,3 +158,4 @@ export async function selectVoiceIncoming(message, event, config, identity, now,
   if (!safeVoiceTranscript(text) || !await authorize(incoming.body)) return null;
   return { ...incoming, body: { ...incoming.body, text, inputKind: 'voice' } };
 }
+

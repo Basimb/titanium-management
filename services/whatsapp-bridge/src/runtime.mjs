@@ -88,12 +88,13 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   const voiceReplyAt = new Map();
   // Private-chat only, authorized senders only, one notice per minute per sender.
   // Tells the person the voice note was not processed instead of silently dropping it.
-  async function voiceRejectionReply(message) {
+  async function voiceRejectionReply(message, event, identity) {
     try {
       const remote = message?.key?.remoteJid;
-      if (!remote || message?.key?.fromMe || !remote.endsWith('@s.whatsapp.net') || !ready || stopped) return;
-      const number = jidNormalizedUser(remote).split('@')[0];
-      if (!/^\d{8,15}$/.test(number) || !await isActiveNumber(number)) return;
+      if (!remote || message?.key?.fromMe || remote.endsWith('@g.us') || !ready || stopped) return;
+      const resolved = await selectIncoming({ ...message, message: { conversation: 'رسالة صوتية' } }, event, config, identity, now(), activatedAt);
+      const number = resolved?.body.senderNumber;
+      if (!number || !await isActiveNumber(number)) return;
       const last = voiceReplyAt.get(number) || 0;
       if (now() - last < 60_000) return;
       voiceReplyAt.set(number, now());
@@ -210,8 +211,11 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
                 authorize: async body => ready && !stopped && current === socket && await isActiveNumber(body.senderNumber)
                   && (body.groupId === null || (await inspectGroup(body.groupId)).allowed),
               });
-            } catch { output.info('Titanium voice: unavailable_or_rejected. No audio or transcript logged.'); }
-            if (!incoming) await voiceRejectionReply(message);
+            } catch (error) {
+              const code = /^(?:voice_[a-z_]+|AbortError|TimeoutError)$/.test(error?.message || '') ? error.message : 'unavailable_or_rejected';
+              output.info(`Titanium voice: ${code}. No audio or transcript logged.`);
+            }
+            if (!incoming) await voiceRejectionReply(message, event, identity);
           }
           if (incoming && await isActiveNumber(incoming.body.senderNumber) && ready && !stopped && current === socket) store.enqueue(incoming);
         }
@@ -352,3 +356,4 @@ export function createBridgeRuntime({ config, store, auth, makeWASocket, jidNorm
   }, 1000);
   return { start: startSocket, stop, status: () => ({ ready, stopped, reconnectCount }) };
 }
+
