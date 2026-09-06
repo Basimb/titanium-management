@@ -16,6 +16,14 @@ test('voice metadata excludes redirects, arbitrary hosts, huge files and nonPTT'
 test('actual Ogg duration is checked, malformed/chained/overlong streams rejected',()=>{
  assert.equal(opusDuration(ogg(1)),1);assert.throws(()=>opusDuration(ogg(301)));assert.throws(()=>opusDuration(Buffer.from('fake')));assert.throws(()=>opusDuration(Buffer.concat([ogg(),ogg()])));
 });
+
+test('complete voice pages without EOS retain duration validation while truncated pages fail',()=>{
+ const bytes=ogg(2);bytes[47+5]=0;
+ assert.equal(opusDuration(bytes),2);
+ assert.throws(()=>opusDuration(bytes.subarray(0,bytes.length-1)));
+ const long=ogg(301);long[47+5]=0;assert.throws(()=>opusDuration(long),/voice_duration_exceeded/);
+ const invalid=ogg(0);invalid[47+5]=0;assert.throws(()=>opusDuration(invalid),/voice_duration_invalid/);
+});
 test('login codes and obvious credentials cannot become work transcripts',()=>{
  for(const text of['123456','١٢٣٤٥٦','رمز الدخول 123456','my password is secret','gsk_1234567890123456'])assert.equal(safeVoiceTranscript(text),null);assert.equal(safeVoiceTranscript('خلصت اللوحة'),'خلصت اللوحة');
 });
@@ -33,3 +41,4 @@ test('voice selection preserves transport sender and marks every transcript as v
  const value=await selectVoiceIncoming(message,{type:'notify'},config,identity,1000000,999000,deps);assert.equal(value.body.senderNumber,'12025550101');assert.equal(value.body.inputKind,'voice');assert.equal(called,1);
  const denied=await selectVoiceIncoming({...message,key:{...message.key,remoteJid:'12025550888@s.whatsapp.net'}},{type:'notify'},config,identity,1000000,999000,deps);assert.equal(denied,null);assert.equal(called,1);
 });
+

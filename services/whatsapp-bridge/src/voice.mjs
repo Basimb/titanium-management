@@ -29,7 +29,7 @@ export function validVoiceMetadata(audio) {
 // or pass a user-controlled URL to Groq. Multiple/chained logical streams are denied.
 export function opusDuration(buffer) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 47 || buffer.length > MAX_VOICE_BYTES) throw new Error('invalid_voice_container');
-  let offset = 0, serial, sequence = 0, preSkip = 0, lastGranule = -1n, ended = false;
+  let offset = 0, serial, sequence = 0, preSkip = 0, lastGranule = -1n, ended = false, packetComplete = false;
   while (offset < buffer.length) {
     if (ended || offset + 27 > buffer.length || buffer.toString('ascii', offset, offset + 4) !== 'OggS' || buffer[offset + 4] !== 0) {
       throw new Error('invalid_voice_container');
@@ -56,10 +56,14 @@ export function opusDuration(buffer) {
       lastGranule = granule;
     }
     ended = !!(flags & 4);
+    packetComplete = buffer[offset + 27 + segments - 1] < 255 && granule >= 0n;
     offset = end;
   }
   const duration = Number(lastGranule - BigInt(preSkip)) / 48_000;
-  if (!ended || !Number.isFinite(duration) || duration <= 0 || duration > MAX_VOICE_SECONDS) throw new Error('voice_duration_exceeded');
+  // Some voice recorders omit EOS. Complete pages, a complete final packet and
+  // the decoded sample counter still establish the bounded duration.
+  if (!packetComplete || !Number.isFinite(duration) || duration <= 0) throw new Error('voice_duration_invalid');
+  if (duration > MAX_VOICE_SECONDS) throw new Error('voice_duration_exceeded');
   return duration;
 }
 
@@ -137,7 +141,7 @@ export function createVoiceTranscriber({ apiKey, downloadContent, fetcher = fetc
       if (!text || typeof result?.duration !== 'number' || result.duration <= 0 || result.duration > MAX_VOICE_SECONDS) throw new Error('voice_transcript_rejected');
       return text;
     } catch (error) {
-      const known = new Set(['voice_unauthorized','voice_too_large','voice_integrity_failed','voice_duration_exceeded','voice_transcription_unavailable','voice_response_too_large','voice_transcript_rejected']);
+      const known = new Set(['voice_unauthorized','voice_too_large','voice_integrity_failed','voice_duration_invalid','voice_duration_exceeded','voice_transcription_unavailable','voice_response_too_large','voice_transcript_rejected']);
       throw new Error(known.has(error?.message) ? error.message : `voice_${stage}_failed`);
     } finally {
       stream?.destroy?.();
