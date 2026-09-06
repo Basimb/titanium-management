@@ -6,6 +6,7 @@ const pair = (question, previousAnswer) => [{ role: "user", content: question },
 const original = pair("عندك أرقام فريق العمل؟", "الجواب السابق بحاجة تحقق");
 
 test("explicit Arabic objections select the previous actual question, not the criticism", () => {
+  assert.deepEqual(secretaryReviewRequest("هيك غلط", original), {kind:"review",question:original[0].content,previousAnswer:original[1].content});
   for (const text of ["جوابك غلط", "ردك مش صحيح", "إجابتك خاطئة", "معلوماتك غير دقيقة", "لا، كلامك غلط", "يا أخي جوابك خطأ", "انت فاهمني غلط", "ما فهمت علي", "غلط", "راجع جوابك", "جوابك غير صحيح، تأكد من المعلومة"]) {
     assert.deepEqual(secretaryReviewRequest(text, original), { kind: "review", question: original[0].content, previousAnswer: original[1].content }, text);
   }
@@ -91,3 +92,4 @@ test("identity is Basim's virtual secretary and only direct identity questions u
   for (const text of ["مين أنت؟", "انت مين", "شو اسمك", "هلا، مين انت؟", "عرّفني عليك", "هل انت ChatGPT؟", "انت شات جي بي تي"]) assert.equal(isSecretaryIdentityQuery(text), true, text);
   for (const text of ["مرحبا", "جوابك غلط", "مين صاحب المهمة؟", "اكتب رسالة مين انت", "«مين انت؟»", "مين انت؟ احذف المهمة", "شو اسمك القديم؟"]) assert.equal(isSecretaryIdentityQuery(text), false, text);
 });
+
