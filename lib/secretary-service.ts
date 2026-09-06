@@ -415,14 +415,21 @@ export async function handleSecretaryEvent(db: DatabaseSync, event: Event, confi
   const reviewRequest = reviewingReview
     ? secretaryReviewRequest(event.text, boundedHistory(conversationHistory(db, key, initial, now, quote)))
     : secretaryReviewRequest(event.text, history, quote ? { question: quote.original_text, previousAnswer: String(JSON.parse(quote.result_json).reply) } : undefined);
-  const earlyRead = (result: Result) => transaction(db, () => {
+  const earlyRead = (result: Result, scope: string[] = []) => transaction(db, () => {
     const freshActor = actorFor(db, event, config);
     if (!config.enabled || !freshActor || JSON.stringify(freshActor) !== JSON.stringify(actor)) return { status: "denied", reply: "" };
     const state = stateFor(db, freshActor); const duplicate = lookup(db, event, freshActor, state); if (duplicate) return duplicate;
     if (fingerprint(state) !== initialHash) return save(db, event, freshActor, { status: "stale", reply: "تغيّرت بيانات العمل؛ خلينا نراجع آخر وضع." }, [], now);
     rememberPendingPreview(db, event, key, db.prepare("SELECT * FROM secretary_pending WHERE conversation_key=?").get(key) as Pending | undefined);
-    return save(db, event, freshActor, result, [], now);
+    return save(db, event, freshActor, result, scope, now);
   });
+  const callerQuestion = event.text.normalize("NFKC").replace(/[أإآ]/g, "ا").replace(/[\u064b-\u065f\u0670\u0640]/g, "").trim();
+  const callerMatch = /^(?:(?:مرحبا|هلا|اهلا)[،,!\s]+)?(?:مين انا|بتعرفني|من انا)[؟?،,\s]*(?:(?:و\s*)?(?:شو|ايش|ما هي)\s+المشاريع(?:\s+(?:الموجودة|الموجوده|النشطة|النشطه))?(?:\s+(?:عندنا|عنا))?[؟?!.\s]*)?$/u.exec(callerQuestion);
+  if (callerMatch && !event.replyToMessageId) {
+    const projects = callerQuestion.includes("المشاريع") ? initial.projects : [];
+    return earlyRead({ status: "summary", reply: `أهلًا ${clean(actor.name, 60)}، بعرفك من رقمك المسجّل عندنا.` + (callerQuestion.includes("المشاريع")
+      ? `\n\nالمشاريع المتاحة إلك:\n${projects.length ? projects.map(p => `• ${clean(p.name, 100)} — ${LABELS[p.status] || clean(p.status)}`).join("\n") : "ما في مشاريع متاحة حاليًا."}` : "") }, projects.map(p => "p:" + p.id));
+  }
   if (isSecretaryIdentityQuery(event.text)) return earlyRead({ status: "summary", reply: SECRETARY_IDENTITY });
   if (reviewRequest?.kind === "clarify") return earlyRead({ status: "clarify", reply: reviewRequest.reply });
   const review = reviewRequest?.kind === "review" ? reviewRequest : null;

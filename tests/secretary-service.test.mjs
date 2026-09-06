@@ -30,6 +30,15 @@ function command(action,fields={},taskId='t',projectId=null) { const p=emptySecr
 function teamMessage(text='الاجتماع بكرا الساعة 10',recipientIds=['all-team']) { const p=emptySecretaryIntent('message_team');p.fields.body=text;p.recipientIds=recipientIds;return p; }
 const pending = db => db.prepare('SELECT * FROM secretary_pending').get();
 
+test('caller identity with projects comes from authenticated sender without model IDs or guessed identity',async t=>{
+ const f=fixture(t);
+ const result=await f.run(emptySecretaryIntent('chat','إنت مين؟'),{senderNumber:'12025550103',text:'مرحبا، مين أنا وشو المشاريع الموجودة عندنا؟'},async()=>{throw Error('Identity needs no inference');});
+ assert.match(result.reply,/أهلًا باسم/);assert.match(result.reply,/مشروع تجريبي/);
+ assert.doesNotMatch(result.reply,/ID:|إنت مين|أنا بخير/);
+ const member=await f.run(emptySecretaryIntent('chat'),{text:'مين أنا؟'},async()=>{throw Error('No inference');});
+ assert.match(member.reply,/أهلًا خالد/);assert.doesNotMatch(member.reply,/أهلًا باسم/);
+});
+
 test('owner personal preferences persist privately and can be replaced and forgotten',async t=>{
  const f=fixture(t); const owner={senderNumber:'12025550103'};
  const saved=await f.run(emptySecretaryIntent('chat'),{...owner,text:'احفظ عني: الردود: مختصرة'});
