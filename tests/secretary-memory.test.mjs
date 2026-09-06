@@ -56,3 +56,18 @@ test('live provider rejection returns honest unverified status without a fake se
  assert.equal(calls,1);assert.match(answer,/ما قدرت أتحقق/);assert.doesNotMatch(answer,/https:\/\//);
 });
 
+test('browser page excerpts are bound to retrieved URLs, never invented answer links',async()=>{
+ let calls=0, review;
+ const answer=await searchSecretaryWeb('public question',{apiKey:'synthetic',fetcher:async(_url,options)=>{
+  if(++calls===1)return Response.json({choices:[{message:{content:'https://invented.example/',executed_tools:[
+   {type:'browser.search',search_results:{results:[{title:'Source',url:'https://example.org/page',content:''}]}},
+   {type:'browser.open',output:'L0: \nL1: URL:\nL2: https://example.org/page\nL3: Actual page evidence'},
+   {type:'browser.open',output:'L0: \nL1: URL:\nL2: https://invented.example/\nL3: Unmatched evidence'}
+  ]}}]});
+  review=JSON.parse(JSON.parse(options.body).messages[1].content);
+  return Response.json({choices:[{finish_reason:'stop',message:{content:'{"assessment":"المصدر يحتاج مراجعة التاريخ."}'}}]});
+ }});
+ assert.equal(review.sources[0].content,'Actual page evidence');
+ assert.match(answer,/Actual page evidence/);assert.doesNotMatch(answer,/invented|Unmatched/);
+});
+

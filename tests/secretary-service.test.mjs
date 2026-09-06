@@ -206,7 +206,7 @@ test('explicit reminder is durable, sent once and not sent for completed work',a
 });
 test('provider search never receives catalog or history and requires actual web tool evidence',async()=>{
  let body;const reply=await searchSecretaryWeb('LG televisions Jordan',{apiKey:'synthetic',fetcher:async(url,options)=>{body=JSON.parse(options.body);return Response.json({choices:[{message:{content:'نتيجة https://example.com/product',executed_tools:[]}}]});}});
- assert.equal(body.model,'groq/compound-mini');assert.deepEqual(body.compound_custom.tools.enabled_tools,['web_search']);assert.doesNotMatch(JSON.stringify(body),/taskCatalog|senderNumber|contacts/);assert.match(reply,/ما قدرت أتحقق/);
+ assert.equal(body.model,'openai/gpt-oss-120b');assert.deepEqual(body.tools,[{type:'browser_search'}]);assert.equal(body.tool_choice,'required');assert.doesNotMatch(JSON.stringify(body),/taskCatalog|senderNumber|contacts/);assert.match(reply,/ما قدرت أتحقق/);
 });
 test('planner response limits reject tool calls and success cannot come from model JSON',async()=>{
  const input={text:'مرحبا',tasks:[],projects:[],users:[],actor:{id:'member',name:'خالد',role:'member'},history:[],now:new Date().toISOString()};
